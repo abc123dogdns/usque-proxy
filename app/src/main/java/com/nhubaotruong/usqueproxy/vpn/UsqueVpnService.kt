@@ -9,7 +9,6 @@ import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
-import android.net.NetworkRequest
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
@@ -26,7 +25,6 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
 import org.json.JSONObject
 import usquebind.Usquebind
 import usquebind.VpnProtector
@@ -54,6 +52,8 @@ class UsqueVpnService : VpnService() {
     private var tunnelThread: Thread? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var startJob: kotlinx.coroutines.Job? = null
+    @Volatile
+    private var currentNetwork: Network? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -213,32 +213,42 @@ class UsqueVpnService : VpnService() {
      * stale — we stop the Go tunnel so its reconnect loop re-establishes on
      * the new network.
      */
+    /**
+     * Tracks the system default network via [ConnectivityManager.registerDefaultNetworkCallback].
+     * Unlike [ConnectivityManager.registerNetworkCallback] with a request filter, this fires
+     * reliably whenever the OS switches the default network (WiFi ↔ cellular), including
+     * when the app is in the background, because the VPN runs as a foreground service.
+     */
     private fun registerNetworkCallback() {
         val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        val request = NetworkRequest.Builder()
-            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-            .build()
-        var currentNetwork: Network? = cm.activeNetwork
+        currentNetwork = cm.activeNetwork
         val callback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                // Only restart if the active network actually changed (WiFi ↔ cellular).
-                // onAvailable fires on initial registration too, so skip if same network.
-                if (currentNetwork != null && network != currentNetwork && isRunning) {
-                    Log.i(TAG, "Network changed: $currentNetwork -> $network, restarting tunnel")
+                val previous = currentNetwork
+                currentNetwork = network
+                if (network != previous && isRunning) {
+                    Log.i(TAG, "Default network changed: $previous -> $network, restarting tunnel")
                     setUnderlyingNetworks(arrayOf(network))
                     restartTunnel()
                 }
-                currentNetwork = network
             }
 
             override fun onLost(network: Network) {
-                Log.i(TAG, "Network lost: $network")
-                currentNetwork = null
-                // Don't restart here — wait for onAvailable with a new network.
-                // The Go-side exponential backoff handles the gap gracefully.
+                Log.i(TAG, "Default network lost: $network")
+                if (currentNetwork == network) {
+                    currentNetwork = null
+                    if (isRunning) setUnderlyingNetworks(null)
+                }
+            }
+
+            override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+                if (network == currentNetwork && isRunning &&
+                    caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) {
+                    setUnderlyingNetworks(arrayOf(network))
+                }
             }
         }
-        cm.registerNetworkCallback(request, callback)
+        cm.registerDefaultNetworkCallback(callback)
         networkCallback = callback
     }
 
@@ -247,6 +257,7 @@ class UsqueVpnService : VpnService() {
             val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
             runCatching { cm.unregisterNetworkCallback(it) }
             networkCallback = null
+            currentNetwork = null
         }
     }
 
@@ -298,7 +309,6 @@ class UsqueVpnService : VpnService() {
         builder.addRoute("8.0.0.0", 7)      // 8-9
         builder.addRoute("11.0.0.0", 8)     // 11
         for (i in 12..126) {                 // 12-126 (skip 127), handle 172.16/12
-            if (i in 172..172) continue      // handle separately
             builder.addRoute("$i.0.0.0", 8)
         }
         builder.addRoute("128.0.0.0", 3)    // 128-159
@@ -310,7 +320,6 @@ class UsqueVpnService : VpnService() {
         builder.addRoute("172.64.0.0", 10)  // 172.64-127
         builder.addRoute("172.128.0.0", 9)  // 172.128-255
         for (i in 173..191) {
-            if (i == 192) continue
             builder.addRoute("$i.0.0.0", 8)
         }
         builder.addRoute("192.0.0.0", 9)    // 192.0-127

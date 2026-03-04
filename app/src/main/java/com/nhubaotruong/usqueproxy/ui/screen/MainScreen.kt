@@ -12,17 +12,10 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
-import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -36,11 +29,9 @@ import com.nhubaotruong.usqueproxy.ui.viewmodel.TunnelStats
 import com.nhubaotruong.usqueproxy.ui.viewmodel.VpnState
 import com.nhubaotruong.usqueproxy.ui.viewmodel.VpnViewModel
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MainScreen(
     viewModel: VpnViewModel,
-    onNavigateToSettings: () -> Unit,
     onRequestVpnPermission: () -> Unit,
 ) {
     val vpnState by viewModel.vpnState.collectAsState()
@@ -48,54 +39,39 @@ fun MainScreen(
     val prefs by viewModel.vpnPrefs.collectAsState()
     val tunnelError by viewModel.tunnelError.collectAsState()
 
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = { Text("UsqueProxy") },
-                actions = {
-                    IconButton(onClick = onNavigateToSettings) {
-                        Icon(Icons.Default.Settings, contentDescription = "Settings")
-                    }
-                }
+    Column(
+        modifier = Modifier.fillMaxSize(),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
+    ) {
+        ConnectButton(
+            state = vpnState,
+            isRegistered = prefs.isActiveRegistered,
+            onConnect = onRequestVpnPermission,
+            onDisconnect = { viewModel.disconnect() },
+        )
+
+        Spacer(Modifier.height(24.dp))
+
+        StatusText(vpnState, prefs.activeProfile)
+
+        tunnelError?.let { error ->
+            Spacer(Modifier.height(12.dp))
+            Text(
+                text = error,
+                color = MaterialTheme.colorScheme.error,
+                style = MaterialTheme.typography.bodySmall,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 32.dp),
             )
+            TextButton(onClick = { viewModel.clearTunnelError() }) {
+                Text("Dismiss")
+            }
         }
-    ) { padding ->
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(padding),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center,
-        ) {
-            ConnectButton(
-                state = vpnState,
-                isRegistered = prefs.isActiveRegistered,
-                onConnect = onRequestVpnPermission,
-                onDisconnect = { viewModel.disconnect() },
-            )
 
-            Spacer(Modifier.height(24.dp))
-
-            StatusText(vpnState, prefs.activeProfile)
-
-            tunnelError?.let { error ->
-                Spacer(Modifier.height(12.dp))
-                Text(
-                    text = error,
-                    color = MaterialTheme.colorScheme.error,
-                    style = MaterialTheme.typography.bodySmall,
-                    textAlign = TextAlign.Center,
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 32.dp),
-                )
-                TextButton(onClick = { viewModel.clearTunnelError() }) {
-                    Text("Dismiss")
-                }
-            }
-
-            if (vpnState == VpnState.CONNECTED) {
-                Spacer(Modifier.height(16.dp))
-                StatsDisplay(stats)
-            }
+        if (vpnState == VpnState.CONNECTED) {
+            Spacer(Modifier.height(16.dp))
+            StatsDisplay(stats)
         }
     }
 }
