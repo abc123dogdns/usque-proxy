@@ -1,5 +1,6 @@
 package com.nhubaotruong.usqueproxy.tile
 
+import android.app.PendingIntent
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -26,65 +27,46 @@ class VpnTileService : TileService() {
         updateTile()
     }
 
-    fun onTileLongClick() {
-        val intent = Intent(this, MainActivity::class.java).apply {
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        }
-        collapseAndStartActivity(intent)
-    }
-
     override fun onClick() {
         super.onClick()
-        val tile = qsTile ?: return
         if (UsqueVpnService.isRunning) {
-            // Immediately show inactive state
-            tile.state = Tile.STATE_INACTIVE
-            tile.subtitle = "Disconnecting..."
-            tile.updateTile()
-            // Stop VPN
+            updateTile(Tile.STATE_INACTIVE, "Disconnecting...")
             val intent = Intent(this, UsqueVpnService::class.java).apply {
                 action = UsqueVpnService.ACTION_STOP
             }
             startService(intent)
         } else {
-            // Start VPN — need to check permission first
             val prepareIntent = VpnService.prepare(this)
             if (prepareIntent != null) {
-                // Permission not granted — launch MainActivity to handle it
-                val intent = Intent(this, MainActivity::class.java).apply {
-                    action = MainActivity.ACTION_CONNECT_VPN
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                }
-                collapseAndStartActivity(intent)
+                // Permission not granted — open app to handle it
+                openApp(MainActivity.ACTION_CONNECT_VPN)
             } else {
-                // Immediately show active state
-                tile.state = Tile.STATE_ACTIVE
-                tile.subtitle = "Connecting..."
-                tile.updateTile()
-                // Permission granted — start service directly
+                updateTile(Tile.STATE_ACTIVE, "Connecting...")
                 val intent = Intent(this, UsqueVpnService::class.java)
                 ContextCompat.startForegroundService(this, intent)
             }
         }
     }
 
-    private fun updateTile() {
+    private fun updateTile(
+        state: Int = if (UsqueVpnService.isRunning) Tile.STATE_ACTIVE else Tile.STATE_INACTIVE,
+        subtitle: String = if (UsqueVpnService.isRunning) "Connected" else "Disconnected",
+    ) {
         val tile = qsTile ?: return
-        if (UsqueVpnService.isRunning) {
-            tile.state = Tile.STATE_ACTIVE
-            tile.subtitle = "Connected"
-        } else {
-            tile.state = Tile.STATE_INACTIVE
-            tile.subtitle = "Disconnected"
-        }
+        tile.state = state
+        tile.subtitle = subtitle
         tile.updateTile()
     }
 
-    private fun collapseAndStartActivity(intent: Intent) {
+    private fun openApp(action: String? = null) {
+        val intent = Intent(this, MainActivity::class.java).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            if (action != null) this.action = action
+        }
         startActivityAndCollapse(
-            android.app.PendingIntent.getActivity(
+            PendingIntent.getActivity(
                 this, 0, intent,
-                android.app.PendingIntent.FLAG_IMMUTABLE or android.app.PendingIntent.FLAG_UPDATE_CURRENT,
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
             ),
         )
     }

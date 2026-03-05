@@ -14,10 +14,6 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
@@ -25,6 +21,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.SegmentedButton
 import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.material3.SingleChoiceSegmentedButtonRow
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -37,6 +34,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import com.google.accompanist.drawablepainter.rememberDrawablePainter
+import com.nhubaotruong.usqueproxy.ui.component.RestartBanner
 import com.nhubaotruong.usqueproxy.data.AppInfo
 import com.nhubaotruong.usqueproxy.data.SplitMode
 import com.nhubaotruong.usqueproxy.ui.viewmodel.VpnViewModel
@@ -47,6 +45,7 @@ fun SplitTunnelScreen(viewModel: VpnViewModel) {
     val apps by viewModel.installedApps.collectAsState()
     val needsRestart by viewModel.needsRestart.collectAsState()
     var searchQuery by remember { mutableStateOf("") }
+    var showSystemApps by remember { mutableStateOf(false) }
 
     LaunchedEffect(prefs.splitMode) {
         if (prefs.splitMode != SplitMode.ALL) {
@@ -62,35 +61,7 @@ fun SplitTunnelScreen(viewModel: VpnViewModel) {
     ) {
         if (needsRestart) {
             item {
-                Card(
-                    colors = CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.tertiaryContainer,
-                    ),
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 16.dp, vertical = 12.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Text(
-                            "Restart to apply changes",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onTertiaryContainer,
-                        )
-                        Button(
-                            onClick = { viewModel.restartVpn() },
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = MaterialTheme.colorScheme.tertiary,
-                                contentColor = MaterialTheme.colorScheme.onTertiary,
-                            ),
-                        ) {
-                            Text("Restart now")
-                        }
-                    }
-                }
+                RestartBanner(onRestart = { viewModel.restartVpn() })
                 Spacer(Modifier.height(4.dp))
             }
         }
@@ -127,17 +98,32 @@ fun SplitTunnelScreen(viewModel: VpnViewModel) {
                     modifier = Modifier.fillMaxWidth(),
                     singleLine = true,
                 )
-                Spacer(Modifier.height(8.dp))
+                Spacer(Modifier.height(4.dp))
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { showSystemApps = !showSystemApps }
+                        .padding(vertical = 8.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text("Show system apps", style = MaterialTheme.typography.bodyLarge)
+                    Switch(checked = showSystemApps, onCheckedChange = { showSystemApps = it })
+                }
+                Spacer(Modifier.height(4.dp))
             }
 
-            val filtered = apps.filter {
-                searchQuery.isBlank() || it.label.contains(searchQuery, ignoreCase = true)
-                        || it.packageName.contains(searchQuery, ignoreCase = true)
-            }
             val activeApps = when (prefs.splitMode) {
                 SplitMode.INCLUDE -> prefs.includedApps
                 SplitMode.EXCLUDE -> prefs.excludedApps
                 SplitMode.ALL -> emptySet()
+            }
+            val filtered = apps.filter { app ->
+                val matchesSearch = searchQuery.isBlank()
+                        || app.label.contains(searchQuery, ignoreCase = true)
+                        || app.packageName.contains(searchQuery, ignoreCase = true)
+                val visible = !app.isSystemApp || showSystemApps || app.packageName in activeApps
+                matchesSearch && visible
             }
             val selected = filtered.filter { it.packageName in activeApps }
             val unselected = filtered.filter { it.packageName !in activeApps }
