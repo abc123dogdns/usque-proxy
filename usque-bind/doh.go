@@ -14,7 +14,9 @@ import (
 	"time"
 )
 
-const virtualDNSIP = "10.255.255.53"
+const virtualDNSIPStr = "10.255.255.53"
+
+var virtualDNSIPv4 = net.IPv4(10, 255, 255, 53).To4()
 
 // dohProxy resolves DNS queries over HTTPS (RFC 8484).
 type dohProxy struct {

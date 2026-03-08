@@ -505,7 +505,7 @@ func connectHappyEyeballs(
 	connectUri string,
 	protector VpnProtector,
 ) (*net.UDPConn, *http3.Transport, *connectip.Conn, *http.Response, error) {
-	const connectionAttemptDelay = 250 * time.Millisecond
+	const connectionAttemptDelay = 50 * time.Millisecond
 
 	// Build ordered endpoint list: IPv6 first, then IPv4.
 	var endpoints []taggedEndpoint
@@ -687,7 +687,7 @@ func forwardUp(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetBuf
 					queryCopy := make([]byte, len(query))
 					copy(queryCopy, query)
 					pool.Put(buf)
-					go dns.handleInterceptedDNS(srcIP, srcPort, net.ParseIP(virtualDNSIP).To4(), queryCopy, device.WritePacket)
+					go dns.handleInterceptedDNS(srcIP, srcPort, virtualDNSIPv4, queryCopy, device.WritePacket)
 					continue
 				}
 			}

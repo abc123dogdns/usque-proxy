@@ -71,14 +71,16 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     fun clearTunnelError() { _tunnelError.value = null }
 
     companion object {
-        private const val POLL_INTERVAL_FOREGROUND = 1_000L // 1s when visible
+        private const val POLL_INTERVAL_FOREGROUND = 2_000L // 2s when visible
+        private const val POLL_INTERVAL_BACKGROUND = 30_000L // 30s when backgrounded
     }
 
     private var pollJob: Job? = null
+    @Volatile private var isForeground = true
 
     private val lifecycleObserver = object : DefaultLifecycleObserver {
-        override fun onStart(owner: LifecycleOwner) = startPolling()
-        override fun onStop(owner: LifecycleOwner) = stopPolling()
+        override fun onStart(owner: LifecycleOwner) { isForeground = true }
+        override fun onStop(owner: LifecycleOwner) { isForeground = false }
     }
 
     init {
@@ -97,7 +99,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                 val error = UsqueVpnService.lastError
                 if (error != null) { _tunnelError.value = error; UsqueVpnService.clearError() }
 
-                if (running) {
+                if (running && isForeground) {
                     runCatching {
                         val json = withContext(Dispatchers.IO) {
                             JSONObject(Usquebind.getStats())
@@ -111,20 +113,16 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                             _connectedSince.value = System.currentTimeMillis() - uptimeSec * 1000L
                         }
                     }
-                } else {
+                } else if (!running) {
                     _connectedSince.value = null
                 }
-                delay(POLL_INTERVAL_FOREGROUND)
+                delay(if (isForeground) POLL_INTERVAL_FOREGROUND else POLL_INTERVAL_BACKGROUND)
             }
         }
     }
 
-    private fun stopPolling() {
-        pollJob?.cancel()
-        pollJob = null
-    }
-
     override fun onCleared() {
+        pollJob?.cancel()
         ProcessLifecycleOwner.get().lifecycle.removeObserver(lifecycleObserver)
         super.onCleared()
     }

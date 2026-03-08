@@ -17,12 +17,9 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.scale
@@ -31,7 +28,6 @@ import androidx.compose.ui.unit.dp
 import com.nhubaotruong.usqueproxy.data.ProfileType
 import com.nhubaotruong.usqueproxy.ui.viewmodel.VpnState
 import com.nhubaotruong.usqueproxy.ui.viewmodel.VpnViewModel
-import kotlinx.coroutines.delay
 
 @Composable
 fun MainScreen(
@@ -151,17 +147,10 @@ private fun StatsDisplay(viewModel: VpnViewModel) {
     val stats by viewModel.stats.collectAsState()
     val connectedSince by viewModel.connectedSince.collectAsState()
 
-    var uptimeSec by remember { mutableIntStateOf(0) }
-    LaunchedEffect(connectedSince) {
+    // Recomposes when stats change (driven by ViewModel poll), no separate timer needed
+    val uptimeSec = remember(connectedSince, stats) {
         val since = connectedSince
-        if (since != null) {
-            while (true) {
-                uptimeSec = ((System.currentTimeMillis() - since) / 1000).toInt()
-                delay(1_000L)
-            }
-        } else {
-            uptimeSec = 0
-        }
+        if (since != null) ((System.currentTimeMillis() - since) / 1000).toInt() else 0
     }
 
     Column(horizontalAlignment = Alignment.CenterHorizontally) {

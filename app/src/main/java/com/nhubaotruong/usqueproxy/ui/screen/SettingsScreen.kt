@@ -31,7 +31,9 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import com.nhubaotruong.usqueproxy.BuildConfig
 import com.nhubaotruong.usqueproxy.ui.component.RestartBanner
 import com.nhubaotruong.usqueproxy.data.DnsMode
 import com.nhubaotruong.usqueproxy.data.ProfileType
@@ -297,7 +299,15 @@ fun SettingsScreen(viewModel: VpnViewModel) {
             HorizontalDivider()
         }
 
-        item { Spacer(Modifier.height(16.dp)) }
+        item {
+            Text(
+                "UsqueProxy v${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.fillMaxWidth().padding(vertical = 16.dp),
+                textAlign = TextAlign.Center,
+            )
+        }
     }
 }
 

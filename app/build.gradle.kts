@@ -20,10 +20,10 @@ android {
 
     defaultConfig {
         applicationId = "com.nhubaotruong.usqueproxy"
-        minSdk = 31
+        minSdk = 33
         targetSdk = 36
         versionCode = 1
-        versionName = "1.6"
+        versionName = "1.7"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -58,6 +58,7 @@ android {
     }
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 }
 
