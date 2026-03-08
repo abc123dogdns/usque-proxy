@@ -13,6 +13,7 @@ import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -20,6 +21,7 @@ import com.nhubaotruong.usqueproxy.ui.screen.MainScreen
 import com.nhubaotruong.usqueproxy.ui.screen.SettingsScreen
 import com.nhubaotruong.usqueproxy.ui.screen.SplitTunnelScreen
 import com.nhubaotruong.usqueproxy.ui.viewmodel.VpnViewModel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 private data class NavItem(val label: String, val icon: ImageVector)
@@ -37,6 +39,15 @@ fun AppNavigation(
 ) {
     val pagerState = rememberPagerState(pageCount = { navItems.size })
     val scope = rememberCoroutineScope()
+
+    // Lightweight state poll — reads volatile booleans only, no JNI.
+    // Automatically cancelled when app goes to background (Activity stopped).
+    LaunchedEffect(Unit) {
+        while (true) {
+            viewModel.refreshState()
+            delay(VpnViewModel.STATE_POLL_INTERVAL)
+        }
+    }
 
     Scaffold(
         bottomBar = {

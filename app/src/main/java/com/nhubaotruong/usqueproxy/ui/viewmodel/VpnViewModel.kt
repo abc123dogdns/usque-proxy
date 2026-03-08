@@ -4,9 +4,6 @@ import android.app.Application
 import android.content.Intent
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
-import androidx.lifecycle.DefaultLifecycleObserver
-import androidx.lifecycle.LifecycleOwner
-import androidx.lifecycle.ProcessLifecycleOwner
 import androidx.lifecycle.viewModelScope
 import com.nhubaotruong.usqueproxy.data.AppInfo
 import com.nhubaotruong.usqueproxy.data.AppRepository
@@ -18,7 +15,6 @@ import com.nhubaotruong.usqueproxy.data.VpnPreferences
 import com.nhubaotruong.usqueproxy.data.VpnPrefs
 import com.nhubaotruong.usqueproxy.vpn.UsqueVpnService
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -71,60 +67,35 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     fun clearTunnelError() { _tunnelError.value = null }
 
     companion object {
-        private const val POLL_INTERVAL_FOREGROUND = 2_000L // 2s when visible
-        private const val POLL_INTERVAL_BACKGROUND = 30_000L // 30s when backgrounded
+        const val STATE_POLL_INTERVAL = 2_000L
+        const val STATS_POLL_INTERVAL = 2_000L
     }
 
-    private var pollJob: Job? = null
-    @Volatile private var isForeground = true
-
-    private val lifecycleObserver = object : DefaultLifecycleObserver {
-        override fun onStart(owner: LifecycleOwner) { isForeground = true }
-        override fun onStop(owner: LifecycleOwner) { isForeground = false }
-    }
-
-    init {
-        ProcessLifecycleOwner.get().lifecycle.addObserver(lifecycleObserver)
-        startPolling()
-    }
-
-    private fun startPolling() {
-        if (pollJob?.isActive == true) return
-        pollJob = viewModelScope.launch {
-            while (true) {
-                val running = UsqueVpnService.isRunning
-                _vpnState.value = if (running) VpnState.CONNECTED else VpnState.DISCONNECTED
-                if (!running) _needsRestart.value = false
-
-                val error = UsqueVpnService.lastError
-                if (error != null) { _tunnelError.value = error; UsqueVpnService.clearError() }
-
-                if (running && isForeground) {
-                    runCatching {
-                        val json = withContext(Dispatchers.IO) {
-                            JSONObject(Usquebind.getStats())
-                        }
-                        _stats.value = TunnelStats(
-                            txBytes = json.optLong("tx_bytes", 0L),
-                            rxBytes = json.optLong("rx_bytes", 0L),
-                        )
-                        if (_connectedSince.value == null) {
-                            val uptimeSec = json.optInt("uptime_sec", 0)
-                            _connectedSince.value = System.currentTimeMillis() - uptimeSec * 1000L
-                        }
-                    }
-                } else if (!running) {
-                    _connectedSince.value = null
-                }
-                delay(if (isForeground) POLL_INTERVAL_FOREGROUND else POLL_INTERVAL_BACKGROUND)
-            }
+    /** Called from composable LaunchedEffect — checks volatile booleans, no JNI. */
+    fun refreshState() {
+        val running = UsqueVpnService.isRunning
+        _vpnState.value = if (running) VpnState.CONNECTED else VpnState.DISCONNECTED
+        if (!running) {
+            _needsRestart.value = false
+            _connectedSince.value = null
         }
+        val error = UsqueVpnService.lastError
+        if (error != null) { _tunnelError.value = error; UsqueVpnService.clearError() }
     }
 
-    override fun onCleared() {
-        pollJob?.cancel()
-        ProcessLifecycleOwner.get().lifecycle.removeObserver(lifecycleObserver)
-        super.onCleared()
+    /** Called from composable LaunchedEffect — JNI getStats(), only when stats are visible. */
+    suspend fun refreshStats() {
+        val json = withContext(Dispatchers.IO) {
+            JSONObject(Usquebind.getStats())
+        }
+        _stats.value = TunnelStats(
+            txBytes = json.optLong("tx_bytes", 0L),
+            rxBytes = json.optLong("rx_bytes", 0L),
+        )
+        if (_connectedSince.value == null) {
+            val uptimeSec = json.optInt("uptime_sec", 0)
+            _connectedSince.value = System.currentTimeMillis() - uptimeSec * 1000L
+        }
     }
 
     fun connect() {

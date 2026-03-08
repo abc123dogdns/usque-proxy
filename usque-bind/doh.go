@@ -18,6 +18,12 @@ const virtualDNSIPStr = "10.255.255.53"
 
 var virtualDNSIPv4 = net.IPv4(10, 255, 255, 53).To4()
 
+// dnsResponsePool reuses buffers for building DNS response packets.
+// Max size: 40 (IPv6) + 8 (UDP) + 4096 (DNS payload) = 4144.
+var dnsResponsePool = sync.Pool{
+	New: func() any { return make([]byte, 4144) },
+}
+
 // dohProxy resolves DNS queries over HTTPS (RFC 8484).
 type dohProxy struct {
 	url       string
@@ -148,38 +154,6 @@ func isDNSPacket(pkt []byte) (srcIP net.IP, srcPort uint16, payload []byte, ok b
 	return
 }
 
-// buildDNSResponse crafts an IPv4/UDP packet wrapping the DNS response back to the original sender.
-func buildDNSResponse(srcIP net.IP, srcPort uint16, dnsResp []byte) []byte {
-	udpLen := 8 + len(dnsResp)
-	totalLen := 20 + udpLen
-	pkt := make([]byte, totalLen)
-
-	// IPv4 header
-	pkt[0] = 0x45 // version=4, IHL=5
-	binary.BigEndian.PutUint16(pkt[2:4], uint16(totalLen))
-	pkt[8] = 64  // TTL
-	pkt[9] = 17  // UDP
-	// Source IP: virtualDNSIP (10.255.255.53)
-	pkt[12] = 10
-	pkt[13] = 255
-	pkt[14] = 255
-	pkt[15] = 53
-	// Destination IP
-	copy(pkt[16:20], srcIP.To4())
-
-	// IP header checksum
-	binary.BigEndian.PutUint16(pkt[10:12], ipChecksum(pkt[:20]))
-
-	// UDP header
-	binary.BigEndian.PutUint16(pkt[20:22], 53)         // src port
-	binary.BigEndian.PutUint16(pkt[22:24], srcPort)     // dst port
-	binary.BigEndian.PutUint16(pkt[24:26], uint16(udpLen))
-	// UDP checksum = 0 (optional for IPv4)
-	copy(pkt[28:], dnsResp)
-
-	return pkt
-}
-
 // ipChecksum computes the IPv4 header checksum.
 func ipChecksum(header []byte) uint16 {
 	var sum uint32
@@ -264,55 +238,311 @@ func skipDNSName(data []byte, offset int) int {
 	}
 }
 
-// handleDNSPacket processes a DNS packet via DoH and writes the response to the TUN device.
-func (d *dohProxy) handleDNSPacket(srcIP net.IP, srcPort uint16, query []byte, writeFunc func([]byte) error) {
-	resp, err := d.resolve(query)
-	if err != nil {
-		log.Printf("DoH resolve error: %v", err)
-		return
-	}
-	pkt := buildDNSResponse(srcIP, srcPort, resp)
-	if err := writeFunc(pkt); err != nil {
-		log.Printf("DoH write error: %v", err)
-	}
+// dnsRequest represents a queued DNS interception request.
+type dnsRequest struct {
+	srcIP     net.IP
+	srcPort   uint16
+	dstIP     net.IP
+	query     []byte
+	writeFunc func([]byte) error
+	isIPv6    bool
 }
 
 // dnsInterceptor is a unified DNS interception wrapper that works across all DNS modes.
 type dnsInterceptor struct {
 	resolver     func(query []byte) ([]byte, error)
 	interceptAll bool // true = intercept all port 53 traffic, false = only virtualDNSIP
+	reqCh        chan dnsRequest
+	closeFunc    func() // called on shutdown to close pooled connections
 }
 
 // newDnsInterceptor creates a dnsInterceptor based on the tunnel config.
-func newDnsInterceptor(cfg *tunnelConfig, protector VpnProtector) *dnsInterceptor {
+func newDnsInterceptor(ctx context.Context, cfg *tunnelConfig, protector VpnProtector) *dnsInterceptor {
+	var resolver func(query []byte) ([]byte, error)
+	var interceptAll bool
+	var closeFunc func()
+	var caches []*sync.Map
+
 	if cfg.DoHURL != "" {
 		doh := newDohProxy(cfg.DoHURL, protector)
-		return &dnsInterceptor{
-			resolver:     doh.resolve,
-			interceptAll: cfg.PreventDnsLeak,
-		}
-	}
-	if cfg.PreventDnsLeak && len(cfg.DnsServers) > 0 {
+		resolver = doh.resolve
+		interceptAll = cfg.PreventDnsLeak
+		caches = append(caches, &doh.cache)
+	} else if cfg.PreventDnsLeak && len(cfg.DnsServers) > 0 {
 		plain := newPlainDnsProxy(cfg.DnsServers, protector)
-		return &dnsInterceptor{
-			resolver:     plain.resolve,
-			interceptAll: true,
+		resolver = plain.resolve
+		interceptAll = true
+		closeFunc = plain.close
+		caches = append(caches, &plain.cache)
+	} else {
+		return nil
+	}
+
+	d := &dnsInterceptor{
+		resolver:     resolver,
+		interceptAll: interceptAll,
+		reqCh:        make(chan dnsRequest, 64),
+		closeFunc:    closeFunc,
+	}
+
+	// Start bounded worker pool
+	const numWorkers = 4
+	for i := 0; i < numWorkers; i++ {
+		go d.worker(ctx)
+	}
+
+	// Start cache eviction
+	for _, c := range caches {
+		startCacheEvictor(ctx, c, 60*time.Second)
+	}
+
+	return d
+}
+
+// worker processes DNS requests from the channel until ctx is cancelled.
+func (d *dnsInterceptor) worker(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case req, ok := <-d.reqCh:
+			if !ok {
+				return
+			}
+			d.handleInterceptedDNS(req)
 		}
 	}
-	return nil
+}
+
+// forwardUp queues a DNS request for processing. Drops the request if the queue is full.
+func (d *dnsInterceptor) forwardUp(req dnsRequest) {
+	select {
+	case d.reqCh <- req:
+	default:
+		log.Println("DNS queue full, dropping request")
+	}
+}
+
+// close shuts down the interceptor, closing any pooled connections.
+func (d *dnsInterceptor) close() {
+	if d.closeFunc != nil {
+		d.closeFunc()
+	}
+}
+
+// handleInterceptedDNS resolves a DNS query and writes the response packet back.
+func (d *dnsInterceptor) handleInterceptedDNS(req dnsRequest) {
+	resp, err := d.resolver(req.query)
+	if err != nil {
+		log.Printf("DNS resolve error: %v", err)
+		return
+	}
+
+	buf := dnsResponsePool.Get().([]byte)
+	var pkt []byte
+
+	if req.isIPv6 {
+		pkt = buildDNSResponseIPv6(buf, req.dstIP, req.srcIP, req.srcPort, resp)
+	} else {
+		pkt = buildDNSResponseIPv4(buf, req.dstIP, req.srcIP, req.srcPort, resp)
+	}
+
+	err = req.writeFunc(pkt)
+	dnsResponsePool.Put(buf)
+	if err != nil {
+		log.Printf("DNS write error: %v", err)
+	}
+}
+
+// buildDNSResponseIPv4 builds an IPv4/UDP DNS response packet into buf.
+func buildDNSResponseIPv4(buf []byte, responseIP, dstIP net.IP, dstPort uint16, dnsResp []byte) []byte {
+	udpLen := 8 + len(dnsResp)
+	totalLen := 20 + udpLen
+	if totalLen > len(buf) {
+		buf = make([]byte, totalLen)
+	}
+	pkt := buf[:totalLen]
+
+	// IPv4 header
+	pkt[0] = 0x45 // version=4, IHL=5
+	pkt[1] = 0
+	binary.BigEndian.PutUint16(pkt[2:4], uint16(totalLen))
+	pkt[4] = 0
+	pkt[5] = 0
+	pkt[6] = 0
+	pkt[7] = 0
+	pkt[8] = 64 // TTL
+	pkt[9] = 17 // UDP
+	pkt[10] = 0
+	pkt[11] = 0
+	copy(pkt[12:16], responseIP.To4())
+	copy(pkt[16:20], dstIP.To4())
+
+	// IP header checksum
+	binary.BigEndian.PutUint16(pkt[10:12], ipChecksum(pkt[:20]))
+
+	// UDP header
+	binary.BigEndian.PutUint16(pkt[20:22], 53)            // src port
+	binary.BigEndian.PutUint16(pkt[22:24], dstPort)        // dst port
+	binary.BigEndian.PutUint16(pkt[24:26], uint16(udpLen))
+	pkt[26] = 0 // UDP checksum = 0 (optional for IPv4)
+	pkt[27] = 0
+	copy(pkt[28:], dnsResp)
+
+	return pkt
+}
+
+// buildDNSResponseIPv6 builds an IPv6/UDP DNS response packet into buf.
+func buildDNSResponseIPv6(buf []byte, responseIP, dstIP net.IP, dstPort uint16, dnsResp []byte) []byte {
+	udpLen := 8 + len(dnsResp)
+	totalLen := 40 + udpLen // 40-byte IPv6 header
+	if totalLen > len(buf) {
+		buf = make([]byte, totalLen)
+	}
+	pkt := buf[:totalLen]
+
+	// IPv6 header
+	pkt[0] = 0x60 // version=6, traffic class=0
+	pkt[1] = 0
+	pkt[2] = 0
+	pkt[3] = 0
+	binary.BigEndian.PutUint16(pkt[4:6], uint16(udpLen)) // payload length
+	pkt[6] = 17 // Next Header = UDP
+	pkt[7] = 64 // Hop Limit
+	// Source IP (16 bytes)
+	copy(pkt[8:24], responseIP.To16())
+	// Destination IP (16 bytes)
+	copy(pkt[24:40], dstIP.To16())
+
+	// UDP header
+	udp := pkt[40:]
+	binary.BigEndian.PutUint16(udp[0:2], 53)            // src port
+	binary.BigEndian.PutUint16(udp[2:4], dstPort)        // dst port
+	binary.BigEndian.PutUint16(udp[4:6], uint16(udpLen))
+	udp[6] = 0 // checksum placeholder
+	udp[7] = 0
+	copy(udp[8:], dnsResp)
+
+	// UDP checksum is mandatory for IPv6
+	binary.BigEndian.PutUint16(udp[6:8], udp6Checksum(pkt[8:24], pkt[24:40], udp[:udpLen]))
+
+	return pkt
+}
+
+// udp6Checksum computes the UDP checksum over the IPv6 pseudo-header and UDP segment.
+func udp6Checksum(srcIP, dstIP, udpSegment []byte) uint16 {
+	var sum uint32
+
+	// Pseudo-header: src IP (16) + dst IP (16) + UDP length (4) + next header (4)
+	for i := 0; i < 16; i += 2 {
+		sum += uint32(binary.BigEndian.Uint16(srcIP[i : i+2]))
+	}
+	for i := 0; i < 16; i += 2 {
+		sum += uint32(binary.BigEndian.Uint16(dstIP[i : i+2]))
+	}
+	sum += uint32(len(udpSegment)) // UDP length
+	sum += 17                      // Next Header = UDP
+
+	// UDP segment
+	for i := 0; i < len(udpSegment)-1; i += 2 {
+		sum += uint32(binary.BigEndian.Uint16(udpSegment[i : i+2]))
+	}
+	if len(udpSegment)%2 != 0 {
+		sum += uint32(udpSegment[len(udpSegment)-1]) << 8
+	}
+
+	for sum > 0xffff {
+		sum = (sum >> 16) + (sum & 0xffff)
+	}
+
+	csum := ^uint16(sum)
+	if csum == 0 {
+		csum = 0xffff // RFC 2460: 0 means no checksum, use 0xffff instead
+	}
+	return csum
+}
+
+// serverConn wraps a UDP connection with a mutex to serialize queries per server.
+// This prevents response mismatch when multiple workers query the same server.
+type serverConn struct {
+	mu   sync.Mutex
+	conn *net.UDPConn
 }
 
 // plainDnsProxy forwards DNS queries via protected UDP sockets to upstream servers.
+// Connections are pooled and reused across queries, one per server.
 type plainDnsProxy struct {
 	servers   []string
 	protector VpnProtector
 	cache     sync.Map // query content -> *cacheEntry
+	mu        sync.Mutex
+	conns     map[string]*serverConn
 }
 
 func newPlainDnsProxy(servers []string, protector VpnProtector) *plainDnsProxy {
 	return &plainDnsProxy{
 		servers:   servers,
 		protector: protector,
+		conns:     make(map[string]*serverConn),
+	}
+}
+
+// getServerConn returns (or creates) the serverConn entry for the given server.
+func (p *plainDnsProxy) getServerConn(server string) *serverConn {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	sc, ok := p.conns[server]
+	if !ok {
+		sc = &serverConn{}
+		p.conns[server] = sc
+	}
+	return sc
+}
+
+// dialConn creates a new protected UDP connection to the server.
+func (p *plainDnsProxy) dialConn(server string) (*net.UDPConn, error) {
+	addr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(server, "53"))
+	if err != nil {
+		return nil, err
+	}
+
+	conn, err := net.DialUDP("udp", nil, addr)
+	if err != nil {
+		return nil, err
+	}
+
+	// Protect the socket from VPN routing
+	rawConn, err := conn.SyscallConn()
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	var protectErr error
+	rawConn.Control(func(fd uintptr) {
+		if !p.protector.ProtectFd(int(fd)) {
+			protectErr = errors.New("VPN protect() failed")
+		}
+	})
+	if protectErr != nil {
+		conn.Close()
+		return nil, protectErr
+	}
+
+	return conn, nil
+}
+
+// close closes all pooled connections.
+func (p *plainDnsProxy) close() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for server, sc := range p.conns {
+		sc.mu.Lock()
+		if sc.conn != nil {
+			sc.conn.Close()
+			sc.conn = nil
+		}
+		sc.mu.Unlock()
+		delete(p.conns, server)
 	}
 }
 
@@ -346,41 +576,34 @@ func (p *plainDnsProxy) resolve(query []byte) ([]byte, error) {
 }
 
 func (p *plainDnsProxy) queryServer(server string, query []byte) ([]byte, error) {
-	addr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(server, "53"))
-	if err != nil {
-		return nil, err
-	}
+	sc := p.getServerConn(server)
 
-	conn, err := net.DialUDP("udp", nil, addr)
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Close()
+	// Hold per-server lock for the entire write+read cycle to prevent response mismatch
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
 
-	// Protect the socket from VPN routing
-	rawConn, err := conn.SyscallConn()
-	if err != nil {
-		return nil, err
-	}
-	var protectErr error
-	rawConn.Control(func(fd uintptr) {
-		if !p.protector.ProtectFd(int(fd)) {
-			protectErr = errors.New("VPN protect() failed")
+	// Lazily create connection
+	if sc.conn == nil {
+		conn, err := p.dialConn(server)
+		if err != nil {
+			return nil, err
 		}
-	})
-	if protectErr != nil {
-		return nil, protectErr
+		sc.conn = conn
 	}
 
-	conn.SetDeadline(time.Now().Add(5 * time.Second))
+	sc.conn.SetDeadline(time.Now().Add(5 * time.Second))
 
-	if _, err := conn.Write(query); err != nil {
+	if _, err := sc.conn.Write(query); err != nil {
+		sc.conn.Close()
+		sc.conn = nil
 		return nil, err
 	}
 
 	buf := make([]byte, 4096)
-	n, err := conn.Read(buf)
+	n, err := sc.conn.Read(buf)
 	if err != nil {
+		sc.conn.Close()
+		sc.conn = nil
 		return nil, err
 	}
 	return buf[:n], nil
@@ -418,44 +641,58 @@ func isAnyDNSPacket(pkt []byte) (srcIP net.IP, srcPort uint16, dstIP net.IP, pay
 	return
 }
 
-// buildDNSResponseFrom crafts an IPv4/UDP packet wrapping a DNS response, using a configurable source IP.
-func buildDNSResponseFrom(responseIP net.IP, srcIP net.IP, srcPort uint16, dnsResp []byte) []byte {
-	udpLen := 8 + len(dnsResp)
-	totalLen := 20 + udpLen
-	pkt := make([]byte, totalLen)
+// isAnyDNSv6Packet checks if pkt is an IPv6 UDP packet destined for ANY IP on port 53.
+// Returns srcIP, srcPort, dstIP, DNS payload, and true if it matches.
+// Only handles packets where Next Header is directly UDP (no extension headers).
+func isAnyDNSv6Packet(pkt []byte) (srcIP net.IP, srcPort uint16, dstIP net.IP, payload []byte, ok bool) {
+	// Minimum: 40 (IPv6) + 8 (UDP) + 12 (DNS header)
+	if len(pkt) < 60 {
+		return nil, 0, nil, nil, false
+	}
+	if pkt[0]>>4 != 6 {
+		return nil, 0, nil, nil, false
+	}
+	// Next Header = UDP (17)
+	if pkt[6] != 17 {
+		return nil, 0, nil, nil, false
+	}
 
-	// IPv4 header
-	pkt[0] = 0x45 // version=4, IHL=5
-	binary.BigEndian.PutUint16(pkt[2:4], uint16(totalLen))
-	pkt[8] = 64 // TTL
-	pkt[9] = 17 // UDP
-	// Source IP: responseIP (the DNS server the app was querying)
-	copy(pkt[12:16], responseIP.To4())
-	// Destination IP
-	copy(pkt[16:20], srcIP.To4())
+	// UDP header starts at offset 40
+	dstPort := binary.BigEndian.Uint16(pkt[42:44])
+	if dstPort != 53 {
+		return nil, 0, nil, nil, false
+	}
 
-	// IP header checksum
-	binary.BigEndian.PutUint16(pkt[10:12], ipChecksum(pkt[:20]))
-
-	// UDP header
-	binary.BigEndian.PutUint16(pkt[20:22], 53)             // src port
-	binary.BigEndian.PutUint16(pkt[22:24], srcPort)         // dst port
-	binary.BigEndian.PutUint16(pkt[24:26], uint16(udpLen))
-	// UDP checksum = 0 (optional for IPv4)
-	copy(pkt[28:], dnsResp)
-
-	return pkt
+	srcIP = make(net.IP, 16)
+	copy(srcIP, pkt[8:24])
+	srcPort = binary.BigEndian.Uint16(pkt[40:42])
+	dstIP = make(net.IP, 16)
+	copy(dstIP, pkt[24:40])
+	payload = pkt[48:]
+	ok = true
+	return
 }
 
-// handleInterceptedDNS resolves a DNS query and writes the response packet back.
-func (d *dnsInterceptor) handleInterceptedDNS(srcIP net.IP, srcPort uint16, dstIP net.IP, query []byte, writeFunc func([]byte) error) {
-	resp, err := d.resolver(query)
-	if err != nil {
-		log.Printf("DNS resolve error: %v", err)
-		return
-	}
-	pkt := buildDNSResponseFrom(dstIP, srcIP, srcPort, resp)
-	if err := writeFunc(pkt); err != nil {
-		log.Printf("DNS write error: %v", err)
-	}
+// startCacheEvictor periodically scans a sync.Map and deletes expired cache entries.
+func startCacheEvictor(ctx context.Context, cache *sync.Map, interval time.Duration) {
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				now := time.Now()
+				cache.Range(func(key, value any) bool {
+					if entry, ok := value.(*cacheEntry); ok {
+						if now.After(entry.expiry) {
+							cache.Delete(key)
+						}
+					}
+					return true
+				})
+			}
+		}
+	}()
 }

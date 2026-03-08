@@ -391,8 +391,9 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 	pool := api.NewNetBuffer(mtu)
 
 	// Create DNS interceptor
-	dns := newDnsInterceptor(cfg, protector)
+	dns := newDnsInterceptor(ctx, cfg, protector)
 	if dns != nil {
+		defer dns.close()
 		if dns.interceptAll {
 			log.Println("DNS interception enabled: all port 53 traffic")
 		} else {
@@ -672,14 +673,28 @@ func forwardUp(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetBuf
 		pkt := buf[:n]
 		txBytes.Add(int64(n))
 
-		// Intercept DNS packets
+		// Intercept DNS packets (IPv4 and IPv6)
 		if dns != nil {
 			if dns.interceptAll {
 				if srcIP, srcPort, dstIP, query, ok := isAnyDNSPacket(pkt); ok {
 					queryCopy := make([]byte, len(query))
 					copy(queryCopy, query)
 					pool.Put(buf)
-					go dns.handleInterceptedDNS(srcIP, srcPort, dstIP, queryCopy, device.WritePacket)
+					dns.forwardUp(dnsRequest{
+						srcIP: srcIP, srcPort: srcPort, dstIP: dstIP,
+						query: queryCopy, writeFunc: device.WritePacket,
+					})
+					continue
+				}
+				if srcIP, srcPort, dstIP, query, ok := isAnyDNSv6Packet(pkt); ok {
+					queryCopy := make([]byte, len(query))
+					copy(queryCopy, query)
+					pool.Put(buf)
+					dns.forwardUp(dnsRequest{
+						srcIP: srcIP, srcPort: srcPort, dstIP: dstIP,
+						query: queryCopy, writeFunc: device.WritePacket,
+						isIPv6: true,
+					})
 					continue
 				}
 			} else {
@@ -687,7 +702,10 @@ func forwardUp(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetBuf
 					queryCopy := make([]byte, len(query))
 					copy(queryCopy, query)
 					pool.Put(buf)
-					go dns.handleInterceptedDNS(srcIP, srcPort, virtualDNSIPv4, queryCopy, device.WritePacket)
+					dns.forwardUp(dnsRequest{
+						srcIP: srcIP, srcPort: srcPort, dstIP: virtualDNSIPv4,
+						query: queryCopy, writeFunc: device.WritePacket,
+					})
 					continue
 				}
 			}
