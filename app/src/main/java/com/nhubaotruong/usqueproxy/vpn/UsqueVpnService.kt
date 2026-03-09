@@ -7,6 +7,7 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.net.ConnectivityManager
+import android.net.IpPrefix
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.VpnService
@@ -143,11 +144,18 @@ class UsqueVpnService : VpnService() {
         when (prefs.dnsMode) {
             DnsMode.SYSTEM -> {
                 val dns = getSystemDnsServers()
-                Log.d(TAG, "Using system DNS: $dns")
-                dns.forEach { builder.addDnsServer(it) }
-                if (prefs.preventDnsLeak) {
-                    config.put("prevent_dns_leak", true)
-                    config.put("dns_servers", JSONArray(dns))
+                Log.d(TAG, "Using system DNS (bypass tunnel): $dns")
+                dns.forEach { addr ->
+                    builder.addDnsServer(addr)
+                    // Exclude DNS server IPs from VPN routes so DNS (port 53)
+                    // and DNS-over-TLS (port 853) traffic bypasses the tunnel.
+                    runCatching {
+                        val inet = java.net.InetAddress.getByName(addr)
+                        val prefix = if (inet is java.net.Inet6Address) 128 else 32
+                        builder.excludeRoute(IpPrefix(inet, prefix))
+                    }.onFailure { e ->
+                        Log.w(TAG, "Failed to exclude DNS route $addr: ${e.message}")
+                    }
                 }
             }
             DnsMode.CLOUDFLARE -> {

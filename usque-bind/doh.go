@@ -1,9 +1,9 @@
 package usquebind
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
-	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -11,11 +11,15 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
 	"golang.org/x/net/http2"
 )
+
+// globalTLSSessionCache is shared across all DoH clients to survive client resets.
+var globalTLSSessionCache = tls.NewLRUClientSessionCache(2048)
 
 const virtualDNSIPStr = "10.255.255.53"
 
@@ -35,6 +39,7 @@ type dohProxy struct {
 	protector  VpnProtector
 	cache      sync.Map             // query content -> *cacheEntry
 	makeClient func() *http.Client  // factory for recreating client on network errors
+	preferGET  bool                 // flip to true on HTTP 405, stay on GET
 }
 
 type cacheEntry struct {
@@ -46,15 +51,18 @@ func newDohProxy(url string, protector VpnProtector) *dohProxy {
 	makeClient := func() *http.Client {
 		dialer := &net.Dialer{Timeout: 5 * time.Second}
 		transport := &http.Transport{
-			ForceAttemptHTTP2:   true,
-			DisableCompression:  true,
-			MaxConnsPerHost:     2,
-			MaxIdleConns:        2,
-			MaxIdleConnsPerHost: 2,
-			IdleConnTimeout:     5 * time.Minute,
-			TLSHandshakeTimeout: 5 * time.Second,
+			ForceAttemptHTTP2:     true,
+			DisableCompression:    true,
+			MaxConnsPerHost:       4,
+			MaxIdleConns:          4,
+			MaxIdleConnsPerHost:   4,
+			IdleConnTimeout:       3 * time.Minute,
+			TLSHandshakeTimeout:   7 * time.Second,
+			ResponseHeaderTimeout: 8 * time.Second,
 			TLSClientConfig: &tls.Config{
-				ClientSessionCache: tls.NewLRUClientSessionCache(0),
+				MinVersion:             tls.VersionTLS12,
+				SessionTicketsDisabled: false,
+				ClientSessionCache:     globalTLSSessionCache,
 			},
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 				conn, err := dialer.DialContext(ctx, network, addr)
@@ -82,7 +90,7 @@ func newDohProxy(url string, protector VpnProtector) *dohProxy {
 
 		return &http.Client{
 			Transport: transport,
-			Timeout:   7 * time.Second,
+			Timeout:   10 * time.Second,
 		}
 	}
 
@@ -96,52 +104,299 @@ func newDohProxy(url string, protector VpnProtector) *dohProxy {
 
 // resolve sends a DNS query to the DoH server and returns the raw DNS response.
 func (d *dohProxy) resolve(query []byte) ([]byte, error) {
-	// Check cache
+	if len(query) < 12 {
+		return nil, errors.New("DNS query too short")
+	}
+
+	// Save original transaction ID and zero it for cache key
+	origID := [2]byte{query[0], query[1]}
+	query[0], query[1] = 0, 0
+
 	cacheKey := string(query)
 	if v, ok := d.cache.Load(cacheKey); ok {
 		entry := v.(*cacheEntry)
 		if time.Now().Before(entry.expiry) {
-			return entry.response, nil
+			// Return copy with caller's transaction ID
+			resp := make([]byte, len(entry.response))
+			copy(resp, entry.response)
+			resp[0], resp[1] = origID[0], origID[1]
+			query[0], query[1] = origID[0], origID[1]
+			return resp, nil
 		}
 		d.cache.Delete(cacheKey)
 	}
 
-	// RFC 8484: Use GET with base64url-encoded query for cache friendliness
-	encoded := base64.RawURLEncoding.EncodeToString(query)
+	// Pad query with EDNS0 padding (128-byte blocks) for the wire
+	padded := padQuery(query)
+
+	const maxRetries = 3
+	var resp *http.Response
+	var lastErr error
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		var req *http.Request
+		var err error
+		if d.preferGET {
+			req, err = d.buildGETRequest(padded)
+		} else {
+			req, err = d.buildPOSTRequest(padded)
+		}
+		if err != nil {
+			query[0], query[1] = origID[0], origID[1]
+			return nil, err
+		}
+
+		resp, err = d.client.Do(req)
+		if err != nil {
+			lastErr = err
+			if isRetryableError(err) {
+				continue
+			}
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				if attempt == maxRetries-1 {
+					d.resetClient()
+				}
+				continue
+			}
+			query[0], query[1] = origID[0], origID[1]
+			return nil, err
+		}
+
+		// On 405 Method Not Allowed, switch to GET and retry
+		if resp.StatusCode == http.StatusMethodNotAllowed && !d.preferGET {
+			resp.Body.Close()
+			d.preferGET = true
+			continue
+		}
+		break
+	}
+
+	if resp == nil {
+		query[0], query[1] = origID[0], origID[1]
+		return nil, fmt.Errorf("DoH request failed after retries: %v", lastErr)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		query[0], query[1] = origID[0], origID[1]
+		return nil, errors.New("DoH server returned " + resp.Status)
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if err != nil {
+		query[0], query[1] = origID[0], origID[1]
+		return nil, err
+	}
+
+	if len(body) < 2 {
+		query[0], query[1] = origID[0], origID[1]
+		return nil, errors.New("DoH response too short")
+	}
+
+	// Cache with zeroed transaction ID
+	cacheCopy := make([]byte, len(body))
+	copy(cacheCopy, body)
+	cacheCopy[0], cacheCopy[1] = 0, 0
+	ttl := extractMinTTL(body)
+	d.cache.Store(cacheKey, &cacheEntry{
+		response: cacheCopy,
+		expiry:   time.Now().Add(ttl),
+	})
+
+	// Patch caller's original ID into response
+	body[0], body[1] = origID[0], origID[1]
+	query[0], query[1] = origID[0], origID[1]
+	return body, nil
+}
+
+func (d *dohProxy) buildPOSTRequest(query []byte) (*http.Request, error) {
+	req, err := http.NewRequest("POST", d.url, bytes.NewReader(query))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/dns-message")
+	req.Header.Set("Accept", "application/dns-message")
+	return req, nil
+}
+
+func (d *dohProxy) buildGETRequest(query []byte) (*http.Request, error) {
+	encoded := base64RawURLEncode(query)
 	reqURL := d.url + "?dns=" + encoded
 	req, err := http.NewRequest("GET", reqURL, nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Accept", "application/dns-message")
+	return req, nil
+}
 
-	resp, err := d.client.Do(req)
-	if err != nil {
-		// On timeout/network errors, reset the client for next request
-		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			d.resetClient()
+// base64RawURLEncode encodes bytes to base64url without padding (RFC 4648 §5).
+func base64RawURLEncode(src []byte) string {
+	const encode = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+	buf := make([]byte, ((len(src)+2)/3)*4)
+	n := 0
+	for i := 0; i < len(src); i += 3 {
+		var val uint32
+		remaining := len(src) - i
+		switch {
+		case remaining >= 3:
+			val = uint32(src[i])<<16 | uint32(src[i+1])<<8 | uint32(src[i+2])
+			buf[n] = encode[val>>18&0x3f]
+			buf[n+1] = encode[val>>12&0x3f]
+			buf[n+2] = encode[val>>6&0x3f]
+			buf[n+3] = encode[val&0x3f]
+			n += 4
+		case remaining == 2:
+			val = uint32(src[i])<<16 | uint32(src[i+1])<<8
+			buf[n] = encode[val>>18&0x3f]
+			buf[n+1] = encode[val>>12&0x3f]
+			buf[n+2] = encode[val>>6&0x3f]
+			n += 3
+		case remaining == 1:
+			val = uint32(src[i]) << 16
+			buf[n] = encode[val>>18&0x3f]
+			buf[n+1] = encode[val>>12&0x3f]
+			n += 2
 		}
-		return nil, err
 	}
-	defer resp.Body.Close()
+	return string(buf[:n])
+}
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, errors.New("DoH server returned " + resp.Status)
+// isRetryableError returns true for transient errors worth retrying (EOF, connection reset).
+func isRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "broken pipe")
+}
+
+// padQuery adds EDNS0 padding (RFC 8467) to a DNS query, padding to 128-byte blocks.
+func padQuery(query []byte) []byte {
+	query = ensureEDNS0(query)
+	padLen := computePaddingSize(len(query))
+	if padLen <= 0 {
+		return query
+	}
+	// Append EDNS0 padding option: code=12, length=padLen, data=zeros
+	opt := make([]byte, 4+padLen)
+	binary.BigEndian.PutUint16(opt[0:2], 12)             // option code: padding
+	binary.BigEndian.PutUint16(opt[2:4], uint16(padLen))  // option length
+	// opt[4:] is already zeroed
+
+	// Update OPT record RDLENGTH (last OPT record in additional section)
+	// The OPT RDLENGTH is at the end of the fixed OPT fields, before RDATA
+	// We need to find and update it
+	result := make([]byte, len(query)+len(opt))
+	copy(result, query)
+	// Update RDLENGTH of the OPT record
+	// OPT record ends at len(query), RDLENGTH is at len(query)-2 relative to RDATA start
+	// Actually, we appended OPT in ensureEDNS0 with RDLENGTH=0 at the end
+	// The RDLENGTH field is 2 bytes before the end of the current query (before any RDATA)
+	rdlenOffset := len(query) - 2
+	if rdlenOffset >= 12 {
+		existingRDLen := binary.BigEndian.Uint16(query[rdlenOffset : rdlenOffset+2])
+		binary.BigEndian.PutUint16(result[rdlenOffset:rdlenOffset+2], existingRDLen+uint16(len(opt)))
+	}
+	copy(result[len(query):], opt)
+	return result
+}
+
+// ensureEDNS0 ensures the query has an OPT pseudo-record in the additional section.
+// If one already exists, returns the query as-is.
+func ensureEDNS0(query []byte) []byte {
+	if len(query) < 12 {
+		return query
 	}
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
-	if err != nil {
-		return nil, err
+	arcount := binary.BigEndian.Uint16(query[10:12])
+
+	// Check if OPT record already exists by scanning additional section
+	qdcount := binary.BigEndian.Uint16(query[4:6])
+	ancount := binary.BigEndian.Uint16(query[6:8])
+	nscount := binary.BigEndian.Uint16(query[8:10])
+
+	offset := 12
+	// Skip questions
+	for i := 0; i < int(qdcount); i++ {
+		offset = skipDNSName(query, offset)
+		if offset < 0 || offset+4 > len(query) {
+			return query
+		}
+		offset += 4
+	}
+	// Skip answers
+	for i := 0; i < int(ancount); i++ {
+		offset = skipResourceRecord(query, offset)
+		if offset < 0 {
+			return query
+		}
+	}
+	// Skip authority
+	for i := 0; i < int(nscount); i++ {
+		offset = skipResourceRecord(query, offset)
+		if offset < 0 {
+			return query
+		}
+	}
+	// Check additional section for OPT (type 41)
+	for i := 0; i < int(arcount); i++ {
+		rrStart := offset
+		offset = skipDNSName(query, offset)
+		if offset < 0 || offset+10 > len(query) {
+			return query
+		}
+		rrType := binary.BigEndian.Uint16(query[offset : offset+2])
+		if rrType == 41 {
+			// OPT record already exists
+			return query
+		}
+		rdlen := binary.BigEndian.Uint16(query[offset+8 : offset+10])
+		offset = offset + 10 + int(rdlen)
+		_ = rrStart
 	}
 
-	// Cache with TTL from DNS response
-	ttl := extractMinTTL(body)
-	d.cache.Store(cacheKey, &cacheEntry{
-		response: body,
-		expiry:   time.Now().Add(ttl),
-	})
+	// Append minimal OPT pseudo-record: name=0x00, type=41, class=4096(UDP size), TTL=0, RDLENGTH=0
+	opt := []byte{
+		0x00,       // root name
+		0x00, 0x29, // type = OPT (41)
+		0x10, 0x00, // class = 4096 (UDP payload size)
+		0x00, 0x00, 0x00, 0x00, // TTL (extended RCODE + flags)
+		0x00, 0x00, // RDLENGTH = 0
+	}
+	result := make([]byte, len(query)+len(opt))
+	copy(result, query)
+	copy(result[len(query):], opt)
+	// Increment ARCOUNT
+	binary.BigEndian.PutUint16(result[10:12], arcount+1)
+	return result
+}
 
-	return body, nil
+// skipResourceRecord skips a DNS resource record and returns the new offset.
+func skipResourceRecord(data []byte, offset int) int {
+	offset = skipDNSName(data, offset)
+	if offset < 0 || offset+10 > len(data) {
+		return -1
+	}
+	rdlen := binary.BigEndian.Uint16(data[offset+8 : offset+10])
+	return offset + 10 + int(rdlen)
+}
+
+// computePaddingSize returns the number of padding bytes needed to reach the next 128-byte block.
+// Accounts for the 4-byte EDNS0 option header (code + length).
+func computePaddingSize(currentLen int) int {
+	// We'll add 4 bytes of option header + padLen bytes of padding
+	// Want total = next multiple of 128
+	total := currentLen + 4 // minimum: option header only
+	remainder := total % 128
+	if remainder == 0 {
+		return 0
+	}
+	return 128 - remainder
 }
 
 // resetClient recreates the HTTP client, discarding stale connections.
@@ -580,15 +835,29 @@ func (p *plainDnsProxy) close() {
 }
 
 func (p *plainDnsProxy) resolve(query []byte) ([]byte, error) {
-	// Check cache
+	if len(query) < 12 {
+		return nil, errors.New("DNS query too short")
+	}
+
+	// Save original transaction ID and zero it for cache key
+	origID := [2]byte{query[0], query[1]}
+	query[0], query[1] = 0, 0
+
 	cacheKey := string(query)
 	if v, ok := p.cache.Load(cacheKey); ok {
 		entry := v.(*cacheEntry)
 		if time.Now().Before(entry.expiry) {
-			return entry.response, nil
+			resp := make([]byte, len(entry.response))
+			copy(resp, entry.response)
+			resp[0], resp[1] = origID[0], origID[1]
+			query[0], query[1] = origID[0], origID[1]
+			return resp, nil
 		}
 		p.cache.Delete(cacheKey)
 	}
+
+	// Restore original ID for wire query (UDP servers expect it)
+	query[0], query[1] = origID[0], origID[1]
 
 	var lastErr error
 	for _, server := range p.servers {
@@ -597,10 +866,13 @@ func (p *plainDnsProxy) resolve(query []byte) ([]byte, error) {
 			lastErr = err
 			continue
 		}
-		// Cache with TTL
+		// Cache with zeroed transaction ID
+		cacheCopy := make([]byte, len(resp))
+		copy(cacheCopy, resp)
+		cacheCopy[0], cacheCopy[1] = 0, 0
 		ttl := extractMinTTL(resp)
 		p.cache.Store(cacheKey, &cacheEntry{
-			response: resp,
+			response: cacheCopy,
 			expiry:   time.Now().Add(ttl),
 		})
 		return resp, nil

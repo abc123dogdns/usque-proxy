@@ -226,16 +226,17 @@ fun SettingsScreen(viewModel: VpnViewModel) {
                     singleLine = true,
                 )
             }
-            SwitchRow("Prevent DNS leaks", prefs.preventDnsLeak) {
-                viewModel.setPreventDnsLeak(it)
-            }
-            if (prefs.preventDnsLeak && prefs.dnsMode == DnsMode.SYSTEM) {
+            if (prefs.dnsMode == DnsMode.SYSTEM) {
                 Text(
-                    "Enable Private DNS in system settings for encrypted DNS",
+                    "DNS and DNS-over-TLS traffic will bypass the tunnel",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(start = 4.dp),
+                    modifier = Modifier.padding(start = 4.dp, top = 4.dp),
                 )
+            } else {
+                SwitchRow("Prevent DNS leaks", prefs.preventDnsLeak) {
+                    viewModel.setPreventDnsLeak(it)
+                }
             }
             HorizontalDivider()
         }
