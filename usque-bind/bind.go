@@ -371,7 +371,7 @@ func cleanEndpoint(ep string) string {
 func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDevice, protector VpnProtector) error {
 	const (
 		mtu             = 1280
-		keepalive       = 30 * time.Second // matches reference, keeps tunnel alive
+		keepalive       = 60 * time.Second // relaxed for battery; safe vs 120-300s server timeouts
 		packetSize      = 1242
 		connectPort     = 443
 		minBackoff      = 1 * time.Second
@@ -436,9 +436,11 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 		}
 
 		quicCfg := &quic.Config{
-			EnableDatagrams:   true,
-			InitialPacketSize: packetSize,
-			KeepAlivePeriod:   keepalive,
+			EnableDatagrams:         true,
+			InitialPacketSize:       packetSize,
+			KeepAlivePeriod:         keepalive,
+			MaxIdleTimeout:          2 * keepalive, // must exceed keep-alive to avoid premature close
+			DisablePathMTUDiscovery: true,           // saves probe traffic; MTU is fixed at 1280
 		}
 
 		udpConn, tr, ipConn, rsp, err := connectHappyEyeballs(
@@ -771,8 +773,10 @@ func cleanup(ipConn *connectip.Conn, udpConn *net.UDPConn, tr *http3.Transport) 
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
 	select {
 	case <-ctx.Done():
-	case <-time.After(d):
+	case <-timer.C:
 	}
 }

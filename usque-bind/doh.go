@@ -19,7 +19,7 @@ import (
 )
 
 // globalTLSSessionCache is shared across all DoH clients to survive client resets.
-var globalTLSSessionCache = tls.NewLRUClientSessionCache(2048)
+var globalTLSSessionCache = tls.NewLRUClientSessionCache(64)
 
 const virtualDNSIPStr = "10.255.255.53"
 
@@ -63,10 +63,10 @@ func newDohProxy(url string, protector VpnProtector) *dohProxy {
 		transport := &http.Transport{
 			ForceAttemptHTTP2:     true,
 			DisableCompression:    true,
-			MaxConnsPerHost:       4,
-			MaxIdleConns:          4,
-			MaxIdleConnsPerHost:   4,
-			IdleConnTimeout:       3 * time.Minute,
+			MaxConnsPerHost:       1,
+			MaxIdleConns:          1,
+			MaxIdleConnsPerHost:   1,
+			IdleConnTimeout:       90 * time.Second,
 			TLSHandshakeTimeout:   7 * time.Second,
 			ResponseHeaderTimeout: 8 * time.Second,
 			TLSClientConfig: &tls.Config{
@@ -95,7 +95,7 @@ func newDohProxy(url string, protector VpnProtector) *dohProxy {
 		// Explicitly configure HTTP/2 with idle connection pinging
 		h2transport, err := http2.ConfigureTransports(transport)
 		if err == nil {
-			h2transport.ReadIdleTimeout = 30 * time.Second
+			h2transport.ReadIdleTimeout = 90 * time.Second
 		}
 
 		return &http.Client{
@@ -659,7 +659,7 @@ func newDnsInterceptor(ctx context.Context, cfg *tunnelConfig, protector VpnProt
 
 	// Start cache eviction
 	for _, c := range caches {
-		startCacheEvictor(ctx, c, 60*time.Second)
+		startCacheEvictor(ctx, c, 5*time.Minute)
 	}
 
 	return d
