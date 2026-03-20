@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"os"
 	"sync"
+	"sync/atomic"
 
 	connectip "github.com/Diniboy1123/connect-ip-go"
 	"github.com/quic-go/quic-go/http3"
@@ -40,6 +41,8 @@ const (
 	l4MTU         = 1280
 )
 
+const l4MaxConsecutiveFailures = 3 // auto-disable after this many consecutive CONNECT failures
+
 // l4Proxy routes TCP through gvisor netstack → HTTP/3 CONNECT streams,
 // while non-TCP traffic is handled via Connect-IP datagrams.
 type l4Proxy struct {
@@ -48,10 +51,11 @@ type l4Proxy struct {
 	hconn   *http3.ClientConn  // shared HTTP/3 connection
 	ipConn  *connectip.Conn    // for fallback awareness
 
-	s       *stack.Stack
-	ep      *channel.Endpoint
-	active  bool               // true if server supports CONNECT and stack is running
-	stopWg  sync.WaitGroup
+	s                    *stack.Stack
+	ep                   *channel.Endpoint
+	active               bool               // true if server supports CONNECT and stack is running
+	consecutiveFailures  atomic.Int32        // auto-disable L4 if too many failures
+	stopWg               sync.WaitGroup
 }
 
 func newL4Proxy(ctx context.Context, tunFile *os.File, hconn *http3.ClientConn, ipConn *connectip.Conn) *l4Proxy {
@@ -144,19 +148,22 @@ func (l *l4Proxy) probeConnect() bool {
 	resp, err := rstr.ReadResponse()
 	rstr.Close()
 	if err != nil {
-		// Connection error reading response — might still be supported.
-		// Some servers may reset the stream for an unreachable target,
-		// which is different from 405/501 (method not supported).
-		log.Printf("L4 probe: read response error: %v (assuming supported)", err)
-		return true
-	}
-
-	// 405 Method Not Allowed or 501 Not Implemented = not supported.
-	if resp.StatusCode == http.StatusMethodNotAllowed || resp.StatusCode == http.StatusNotImplemented {
+		// Stream error (reset, etc.) — server likely doesn't support CONNECT.
+		// Be conservative: only activate L4 if we get a clear HTTP response.
+		log.Printf("L4 probe: read response error: %v (assuming not supported)", err)
 		return false
 	}
 
-	// Any other status (200, 502 connection refused, etc.) means CONNECT is supported.
+	// Only consider CONNECT supported if the server returns a valid
+	// HTTP response that isn't an explicit method rejection.
+	// 405/501 = definitely not supported. Stream errors = not supported.
+	// 200/502/503 etc. = server understands CONNECT, target may just be unreachable.
+	if resp.StatusCode == http.StatusMethodNotAllowed || resp.StatusCode == http.StatusNotImplemented {
+		log.Printf("L4 probe: server returned %s — CONNECT not supported", resp.Status)
+		return false
+	}
+
+	log.Printf("L4 probe: server returned %d — CONNECT supported", resp.StatusCode)
 	return true
 }
 
@@ -201,6 +208,7 @@ func (l *l4Proxy) handleTCP(fr *tcp.ForwarderRequest) {
 		rstr, err := l.hconn.OpenRequestStream(l.ctx)
 		if err != nil {
 			log.Printf("L4 proxy: open stream to %s failed: %v", target, err)
+			l.recordFailure()
 			return
 		}
 		defer rstr.Close()
@@ -212,18 +220,24 @@ func (l *l4Proxy) handleTCP(fr *tcp.ForwarderRequest) {
 		})
 		if err != nil {
 			log.Printf("L4 proxy: send CONNECT to %s failed: %v", target, err)
+			l.recordFailure()
 			return
 		}
 
 		resp, err := rstr.ReadResponse()
 		if err != nil {
 			log.Printf("L4 proxy: CONNECT response from %s failed: %v", target, err)
+			l.recordFailure()
 			return
 		}
 		if resp.StatusCode != http.StatusOK {
 			log.Printf("L4 proxy: CONNECT to %s rejected: %s", target, resp.Status)
+			l.recordFailure()
 			return
 		}
+
+		// CONNECT succeeded — reset failure counter.
+		l.consecutiveFailures.Store(0)
 
 		// Bidirectional relay.
 		var relayWg sync.WaitGroup
@@ -235,6 +249,18 @@ func (l *l4Proxy) handleTCP(fr *tcp.ForwarderRequest) {
 		io.Copy(conn, rstr) // Cloudflare → app
 		relayWg.Wait()
 	}()
+}
+
+// recordFailure increments the consecutive failure counter and auto-disables
+// L4 proxy if it exceeds the threshold. TCP traffic will then fall back to
+// Connect-IP datagrams via the existing forwardUp path.
+func (l *l4Proxy) recordFailure() {
+	if n := l.consecutiveFailures.Add(1); n >= l4MaxConsecutiveFailures {
+		if l.active {
+			l.active = false
+			log.Printf("L4 proxy: %d consecutive CONNECT failures, disabling — TCP falls back to Connect-IP", n)
+		}
+	}
 }
 
 // netstackToTun reads outbound packets from the gvisor stack
