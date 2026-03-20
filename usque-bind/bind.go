@@ -513,15 +513,10 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 		backoff = minBackoff
 		log.Println("Connected to MASQUE server")
 
-		// Start L4 proxy (TCP via HTTP/3 CONNECT streams, bypasses TCP-in-QUIC meltdown).
-		l4ctx, l4cancel := context.WithCancel(ctx)
-		l4 := newL4Proxy(l4ctx, device.(*FdAdapter).file, hconn, ipConn)
-		l4started := l4.start()
-
 		errChan := make(chan error, 2)
 		var wg sync.WaitGroup
 		wg.Add(2)
-		go func() { defer wg.Done(); forwardUp(device, ipConn, pool, errChan, dns, l4) }()
+		go func() { defer wg.Done(); forwardUp(device, ipConn, pool, errChan, dns) }()
 		go func() { defer wg.Done(); forwardDown(device, ipConn, pool, errChan) }()
 
 		isNetworkReconnect := false
@@ -540,10 +535,6 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 		case <-ctx.Done():
 		}
 
-		l4cancel()
-		if l4started {
-			l4.stop()
-		}
 		cleanup(ipConn, udpConn, tr)
 		wg.Wait() // wait for forwarding goroutines to exit before reconnecting
 		if ctx.Err() != nil {
@@ -746,7 +737,7 @@ func connectTunnelProtected(
 	return udpConn, tr, hconn, ipConn, rsp, nil
 }
 
-func forwardUp(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetBuffer, errChan chan<- error, dns *dnsInterceptor, l4 *l4Proxy) {
+func forwardUp(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetBuffer, errChan chan<- error, dns *dnsInterceptor) {
 	for {
 		buf := pool.Get()
 		n, err := device.ReadPacket(buf)
@@ -784,14 +775,7 @@ func forwardUp(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetBuf
 			}
 		}
 
-		// TCP packets → gvisor netstack for L4 proxying (avoids TCP-in-QUIC meltdown)
-		if l4 != nil && l4.active && isTCPPacket(pkt) {
-			l4.injectInbound(pkt)
-			pool.Put(buf)
-			continue
-		}
-
-		// Everything else → Connect-IP datagrams (UDP, ICMP, etc.)
+		// Send via Connect-IP datagrams (UDP, ICMP, TCP, etc.)
 		icmp, err := ipConn.WritePacket(pkt)
 		pool.Put(buf)
 		if err != nil {
