@@ -9,7 +9,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.isSystemInDarkTheme
-import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 import androidx.lifecycle.lifecycleScope
 import com.nhubaotruong.usqueproxy.data.ThemeMode
@@ -40,7 +40,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContent {
-            val prefs by vpnViewModel.vpnPrefs.collectAsState()
+            val prefs by vpnViewModel.vpnPrefs.collectAsStateWithLifecycle()
             val darkTheme = when (prefs.themeMode) {
                 ThemeMode.LIGHT -> false
                 ThemeMode.DARK -> true

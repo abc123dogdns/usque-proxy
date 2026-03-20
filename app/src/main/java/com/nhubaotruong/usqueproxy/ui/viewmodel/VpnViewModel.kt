@@ -37,8 +37,29 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     private val prefs = VpnPreferences(application)
     private val appRepo = AppRepository(application)
 
+    init {
+        // Collect VPN service events for instant state updates (no polling needed).
+        viewModelScope.launch {
+            UsqueVpnService.events.collect { event ->
+                when (event) {
+                    is UsqueVpnService.Companion.VpnServiceEvent.Started -> {
+                        _vpnState.value = VpnState.CONNECTED
+                    }
+                    is UsqueVpnService.Companion.VpnServiceEvent.Stopped -> {
+                        _vpnState.value = VpnState.DISCONNECTED
+                        _connectedSince.value = null
+                        _needsRestart.value = false
+                    }
+                    is UsqueVpnService.Companion.VpnServiceEvent.Error -> {
+                        _tunnelError.value = event.message
+                    }
+                }
+            }
+        }
+    }
+
     val vpnPrefs: StateFlow<VpnPrefs> = prefs.prefsFlow
-        .stateIn(viewModelScope, SharingStarted.Eagerly, VpnPrefs())
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), VpnPrefs())
 
     private val _vpnState = MutableStateFlow(VpnState.DISCONNECTED)
     val vpnState: StateFlow<VpnState> = _vpnState.asStateFlow()
@@ -67,7 +88,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
 
     companion object {
         const val STATE_POLL_INTERVAL = 5_000L
-        const val STATS_POLL_INTERVAL = 5_000L
+        const val STATS_POLL_INTERVAL = 10_000L
     }
 
     /** Called from composable LaunchedEffect — checks volatile booleans, no JNI. */

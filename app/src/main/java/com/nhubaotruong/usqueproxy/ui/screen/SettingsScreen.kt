@@ -24,7 +24,7 @@ import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -43,10 +43,10 @@ import com.nhubaotruong.usqueproxy.ui.viewmodel.VpnViewModel
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SettingsScreen(viewModel: VpnViewModel) {
-    val prefs by viewModel.vpnPrefs.collectAsState()
-    val isRegistering by viewModel.isRegistering.collectAsState()
-    val registerError by viewModel.registerError.collectAsState()
-    val needsRestart by viewModel.needsRestart.collectAsState()
+    val prefs by viewModel.vpnPrefs.collectAsStateWithLifecycle()
+    val isRegistering by viewModel.isRegistering.collectAsStateWithLifecycle()
+    val registerError by viewModel.registerError.collectAsStateWithLifecycle()
+    val needsRestart by viewModel.needsRestart.collectAsStateWithLifecycle()
 
     LazyColumn(
         modifier = Modifier

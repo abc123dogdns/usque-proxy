@@ -45,7 +45,7 @@ type cacheEntry struct {
 	staleDeadline time.Time
 }
 
-const staleGracePeriod = 5 * time.Minute
+const staleGracePeriod = 30 * time.Minute
 
 // warmupQuery is a minimal DNS query for "." (root) NS record, used to pre-warm the connection.
 var warmupQuery = []byte{
@@ -62,7 +62,7 @@ func newDohProxy(url string, protector VpnProtector) *dohProxy {
 			MaxConnsPerHost:       1,
 			MaxIdleConns:          1,
 			MaxIdleConnsPerHost:   1,
-			IdleConnTimeout:       120 * time.Second,
+			IdleConnTimeout:       300 * time.Second,
 			TLSHandshakeTimeout:   7 * time.Second,
 			ResponseHeaderTimeout: 8 * time.Second,
 			TLSClientConfig: &tls.Config{
@@ -91,7 +91,7 @@ func newDohProxy(url string, protector VpnProtector) *dohProxy {
 		// Explicitly configure HTTP/2 with idle connection pinging
 		h2transport, err := http2.ConfigureTransports(transport)
 		if err == nil {
-			h2transport.ReadIdleTimeout = 120 * time.Second
+			h2transport.ReadIdleTimeout = 300 * time.Second
 		}
 
 		return &http.Client{

@@ -17,6 +17,9 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.repeatOnLifecycle
 import com.nhubaotruong.usqueproxy.ui.screen.MainScreen
 import com.nhubaotruong.usqueproxy.ui.screen.SettingsScreen
 import com.nhubaotruong.usqueproxy.ui.screen.SplitTunnelScreen
@@ -41,11 +44,14 @@ fun AppNavigation(
     val scope = rememberCoroutineScope()
 
     // Lightweight state poll — reads volatile booleans only, no JNI.
-    // Automatically cancelled when app goes to background (Activity stopped).
-    LaunchedEffect(Unit) {
-        while (true) {
-            viewModel.refreshState()
-            delay(VpnViewModel.STATE_POLL_INTERVAL)
+    // Paused when app goes to background via repeatOnLifecycle(STARTED).
+    val lifecycleOwner = LocalLifecycleOwner.current
+    LaunchedEffect(lifecycleOwner) {
+        lifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            while (true) {
+                viewModel.refreshState()
+                delay(VpnViewModel.STATE_POLL_INTERVAL)
+            }
         }
     }
 

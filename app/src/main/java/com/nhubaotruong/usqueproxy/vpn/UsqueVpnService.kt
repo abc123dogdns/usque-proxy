@@ -26,6 +26,9 @@ import com.nhubaotruong.usqueproxy.data.VpnPrefs
 import com.nhubaotruong.usqueproxy.tile.VpnTileService
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import org.json.JSONArray
@@ -53,6 +56,16 @@ class UsqueVpnService : VpnService() {
             private set
 
         fun clearError() { lastError = null }
+
+        /** Event emitted on VPN state changes — ViewModel collects instead of polling. */
+        sealed interface VpnServiceEvent {
+            data object Started : VpnServiceEvent
+            data object Stopped : VpnServiceEvent
+            data class Error(val message: String) : VpnServiceEvent
+        }
+
+        private val _events = MutableSharedFlow<VpnServiceEvent>(extraBufferCapacity = 8)
+        val events: SharedFlow<VpnServiceEvent> = _events.asSharedFlow()
 
         // Pre-computed IpPrefix exclusions — avoids InetAddress.getByName() on every VPN start
         private val LOCAL_NETWORK_EXCLUSIONS_V4: List<Pair<java.net.InetAddress, Int>> by lazy {
@@ -269,6 +282,7 @@ class UsqueVpnService : VpnService() {
 
         val fd = vpnInterface!!.fd
         isRunning = true
+        _events.tryEmit(VpnServiceEvent.Started)
         VpnTileService.requestUpdate(this)
 
         val protector = object : VpnProtector {
@@ -283,8 +297,10 @@ class UsqueVpnService : VpnService() {
             } catch (e: Throwable) {
                 Log.e(TAG, "Tunnel error", e)
                 lastError = e.message ?: "Tunnel failed"
+                _events.tryEmit(VpnServiceEvent.Error(lastError!!))
             } finally {
                 isRunning = false
+                _events.tryEmit(VpnServiceEvent.Stopped)
                 VpnTileService.requestUpdate(this@UsqueVpnService)
                 // Only self-stop if not in a managed restart/stop — during those,
                 // stopVpnInternal() handles the lifecycle.
@@ -391,6 +407,7 @@ class UsqueVpnService : VpnService() {
             vpnInterface?.close()
             vpnInterface = null
             isRunning = false
+            _events.tryEmit(VpnServiceEvent.Stopped)
             VpnTileService.requestUpdate(this)
             // stopForeground/stopSelf must run on main thread
             Handler(Looper.getMainLooper()).post {

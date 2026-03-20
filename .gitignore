@@ -17,3 +17,5 @@ usque-bind/build/
 app/libs/*.aar
 keystore.properties
 *.jks
+usque-android/
+android/

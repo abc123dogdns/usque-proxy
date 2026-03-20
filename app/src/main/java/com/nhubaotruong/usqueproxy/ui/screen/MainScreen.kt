@@ -19,7 +19,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
@@ -29,6 +29,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.repeatOnLifecycle
 import com.nhubaotruong.usqueproxy.data.ProfileType
 import com.nhubaotruong.usqueproxy.ui.viewmodel.VpnState
 import com.nhubaotruong.usqueproxy.ui.viewmodel.VpnViewModel
@@ -39,9 +42,9 @@ fun MainScreen(
     viewModel: VpnViewModel,
     onRequestVpnPermission: () -> Unit,
 ) {
-    val vpnState by viewModel.vpnState.collectAsState()
-    val prefs by viewModel.vpnPrefs.collectAsState()
-    val tunnelError by viewModel.tunnelError.collectAsState()
+    val vpnState by viewModel.vpnState.collectAsStateWithLifecycle()
+    val prefs by viewModel.vpnPrefs.collectAsStateWithLifecycle()
+    val tunnelError by viewModel.tunnelError.collectAsStateWithLifecycle()
 
     Column(
         modifier = Modifier.fillMaxSize(),
@@ -149,25 +152,30 @@ private fun StatusText(state: VpnState, activeProfile: ProfileType) {
 
 @Composable
 private fun StatsDisplay(viewModel: VpnViewModel) {
-    val stats by viewModel.stats.collectAsState()
-    val connectedSince by viewModel.connectedSince.collectAsState()
+    val stats by viewModel.stats.collectAsStateWithLifecycle()
+    val connectedSince by viewModel.connectedSince.collectAsStateWithLifecycle()
 
-    // JNI getStats() — only runs while this composable is in the tree.
-    // Automatically cancelled when user navigates away or VPN disconnects.
-    LaunchedEffect(Unit) {
-        while (true) {
-            runCatching { viewModel.refreshStats() }
-            delay(VpnViewModel.STATS_POLL_INTERVAL)
+    // JNI getStats() — only runs while this composable is in the tree and app is in foreground.
+    val lifecycleOwner = LocalLifecycleOwner.current
+    LaunchedEffect(lifecycleOwner) {
+        lifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            while (true) {
+                runCatching { viewModel.refreshStats() }
+                delay(VpnViewModel.STATS_POLL_INTERVAL)
+            }
         }
     }
 
     // Lightweight 1s uptime tick — no JNI, just System.currentTimeMillis()
+    // Paused in background via repeatOnLifecycle.
     var uptimeSec by remember { mutableIntStateOf(0) }
-    LaunchedEffect(connectedSince) {
+    LaunchedEffect(connectedSince, lifecycleOwner) {
         val since = connectedSince ?: return@LaunchedEffect
-        while (true) {
-            uptimeSec = ((System.currentTimeMillis() - since) / 1000).toInt()
-            delay(1_000L)
+        lifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            while (true) {
+                uptimeSec = ((System.currentTimeMillis() - since) / 1000).toInt()
+                delay(1_000L)
+            }
         }
     }
 

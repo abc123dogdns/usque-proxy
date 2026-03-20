@@ -25,7 +25,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -41,9 +41,9 @@ import com.nhubaotruong.usqueproxy.ui.viewmodel.VpnViewModel
 
 @Composable
 fun SplitTunnelScreen(viewModel: VpnViewModel) {
-    val prefs by viewModel.vpnPrefs.collectAsState()
-    val apps by viewModel.installedApps.collectAsState()
-    val needsRestart by viewModel.needsRestart.collectAsState()
+    val prefs by viewModel.vpnPrefs.collectAsStateWithLifecycle()
+    val apps by viewModel.installedApps.collectAsStateWithLifecycle()
+    val needsRestart by viewModel.needsRestart.collectAsStateWithLifecycle()
     var searchQuery by remember { mutableStateOf("") }
     var showSystemApps by remember { mutableStateOf(false) }
 
