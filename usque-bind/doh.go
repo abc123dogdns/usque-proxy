@@ -898,3 +898,182 @@ func isAnyDNSv6Packet(pkt []byte) (srcIP net.IP, srcPort uint16, dstIP net.IP, p
 	return
 }
 
+// isAnyDNSResponsePacket checks if pkt is an IPv4 UDP packet FROM port 53 (DNS response).
+func isAnyDNSResponsePacket(pkt []byte) (srcIP net.IP, srcPort uint16, dstIP net.IP, payload []byte, ok bool) {
+	if len(pkt) < 40 {
+		return nil, 0, nil, nil, false
+	}
+	if pkt[0]>>4 != 4 {
+		return nil, 0, nil, nil, false
+	}
+	if pkt[9] != 17 {
+		return nil, 0, nil, nil, false
+	}
+	ihl := int(pkt[0]&0x0f) * 4
+	if len(pkt) < ihl+8 {
+		return nil, 0, nil, nil, false
+	}
+	if binary.BigEndian.Uint16(pkt[ihl:ihl+2]) != 53 {
+		return nil, 0, nil, nil, false
+	}
+	srcIP = net.IP(pkt[12:16]).To4()
+	srcPort = 53
+	dstIP = net.IP(pkt[16:20]).To4()
+	payload = pkt[ihl+8:]
+	ok = true
+	return
+}
+
+// isAnyDNSResponseV6Packet checks if pkt is an IPv6 UDP packet FROM port 53 (DNS response).
+func isAnyDNSResponseV6Packet(pkt []byte) (srcIP net.IP, srcPort uint16, dstIP net.IP, payload []byte, ok bool) {
+	if len(pkt) < 60 {
+		return nil, 0, nil, nil, false
+	}
+	if pkt[0]>>4 != 6 {
+		return nil, 0, nil, nil, false
+	}
+	if pkt[6] != 17 {
+		return nil, 0, nil, nil, false
+	}
+	if binary.BigEndian.Uint16(pkt[40:42]) != 53 {
+		return nil, 0, nil, nil, false
+	}
+	srcIP = make(net.IP, 16)
+	copy(srcIP, pkt[8:24])
+	srcPort = 53
+	dstIP = make(net.IP, 16)
+	copy(dstIP, pkt[24:40])
+	payload = pkt[48:]
+	ok = true
+	return
+}
+
+// dnsQuestionKey extracts the question section (QNAME+QTYPE+QCLASS) from a DNS message
+// for use as a cache key. Works for both queries and responses.
+func dnsQuestionKey(payload []byte) (string, bool) {
+	if len(payload) < 12 {
+		return "", false
+	}
+	qdcount := binary.BigEndian.Uint16(payload[4:6])
+	if qdcount == 0 {
+		return "", false
+	}
+	start := 12
+	end := skipDNSName(payload, start)
+	if end < 0 || end+4 > len(payload) {
+		return "", false
+	}
+	end += 4 // QTYPE + QCLASS
+	return string(payload[start:end]), true
+}
+
+// tunnelDnsCache caches DNS responses for non-DoH mode to avoid redundant tunnel round-trips.
+type tunnelDnsCache struct {
+	cache *lruCache
+}
+
+func newTunnelDnsCache(capacity int) *tunnelDnsCache {
+	return &tunnelDnsCache{
+		cache: newLRUCache(capacity),
+	}
+}
+
+// checkAndRespond checks a DNS query packet against the cache.
+// Returns true if a cached response was written to TUN (cache hit).
+func (c *tunnelDnsCache) checkAndRespond(pkt []byte, writeFunc func([]byte) error) bool {
+	var srcIP, dstIP net.IP
+	var srcPort uint16
+	var query []byte
+	var isIPv6 bool
+
+	if s, sp, d, q, ok := isAnyDNSPacket(pkt); ok {
+		srcIP, srcPort, dstIP, query = s, sp, d, q
+	} else if s, sp, d, q, ok := isAnyDNSv6Packet(pkt); ok {
+		srcIP, srcPort, dstIP, query = s, sp, d, q
+		isIPv6 = true
+	} else {
+		return false
+	}
+
+	if len(query) < 12 {
+		return false
+	}
+
+	key, ok := dnsQuestionKey(query)
+	if !ok {
+		return false
+	}
+
+	entry, ok := c.cache.get(key)
+	if !ok {
+		return false
+	}
+
+	now := time.Now()
+	if now.After(entry.staleDeadline) {
+		c.cache.delete(key)
+		return false
+	}
+
+	// Build response with original transaction ID
+	resp := make([]byte, len(entry.response))
+	copy(resp, entry.response)
+	resp[0], resp[1] = query[0], query[1]
+
+	buf := dnsResponsePool.Get().([]byte)
+	var responsePkt []byte
+	if isIPv6 {
+		responsePkt = buildDNSResponseIPv6(buf, dstIP, srcIP, srcPort, resp)
+	} else {
+		responsePkt = buildDNSResponseIPv4(buf, dstIP, srcIP, srcPort, resp)
+	}
+
+	err := writeFunc(responsePkt)
+	dnsResponsePool.Put(buf)
+	return err == nil
+}
+
+// cacheResponse extracts DNS response data from an incoming packet and caches it.
+func (c *tunnelDnsCache) cacheResponse(pkt []byte) {
+	var payload []byte
+
+	if _, _, _, p, ok := isAnyDNSResponsePacket(pkt); ok {
+		payload = p
+	} else if _, _, _, p, ok := isAnyDNSResponseV6Packet(pkt); ok {
+		payload = p
+	} else {
+		return
+	}
+
+	if len(payload) < 12 {
+		return
+	}
+	// Only cache responses (QR bit set)
+	if payload[2]&0x80 == 0 {
+		return
+	}
+	// Only cache successful responses (NOERROR=0 or NXDOMAIN=3)
+	rcode := payload[3] & 0x0f
+	if rcode != 0 && rcode != 3 {
+		return
+	}
+
+	key, ok := dnsQuestionKey(payload)
+	if !ok {
+		return
+	}
+
+	ttl := extractMinTTL(payload)
+	cacheCopy := make([]byte, len(payload))
+	copy(cacheCopy, payload)
+	cacheCopy[0], cacheCopy[1] = 0, 0
+
+	now := time.Now()
+	c.cache.put(key, &cacheEntry{
+		response:      cacheCopy,
+		expiry:        now.Add(ttl),
+		staleDeadline: now.Add(ttl + staleGracePeriod),
+		originalTTL:   ttl,
+	})
+}
+

@@ -417,14 +417,18 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 
 	pool := api.NewNetBuffer(mtu)
 
-	// Create DNS interceptor (only when DoH URL is configured)
+	// Create DNS interceptor (DoH) or tunnel DNS cache (non-DoH)
 	var dns *dnsInterceptor
+	var dnsCache *tunnelDnsCache
 	if cfg.DoHURL != "" {
 		dns = newDnsInterceptor(ctx, cfg, protector)
 		if dns != nil {
 			defer dns.close()
 			log.Println("DNS interception enabled: all port 53 traffic via DoH")
 		}
+	} else {
+		dnsCache = newTunnelDnsCache(512)
+		log.Println("DNS tunnel cache enabled")
 	}
 
 	// Certificate cache: generate once, reuse until near expiry.
@@ -478,19 +482,27 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 			case "wifi":
 				keepalive = 110 * time.Second
 			case "cellular":
-				keepalive = 25 * time.Second
+				keepalive = 50 * time.Second
 			}
+		}
+
+		// Adaptive PMTU: WiFi paths reliably support 1500; cellular stays conservative
+		disablePMTU := true
+		pktSize := uint16(packetSize) // 1242
+		if v := networkHint.Load(); v != nil && v.(string) == "wifi" {
+			disablePMTU = false
+			pktSize = 1400
 		}
 
 		quicCfg := &quic.Config{
 			EnableDatagrams:         true,
-			InitialPacketSize:       packetSize,
+			InitialPacketSize:       pktSize,
 			KeepAlivePeriod:         keepalive,
 			MaxIdleTimeout:          300 * time.Second, // 3+ keepalive rounds before timeout; CF allows up to 300s
-			DisablePathMTUDiscovery: true,              // saves probe traffic; MTU is fixed at 1280
+			DisablePathMTUDiscovery: disablePMTU,
 		}
 
-		udpConn, tr, hconn, ipConn, rsp, err := connectHappyEyeballs(
+		udpConn, tr, _, ipConn, rsp, err := connectHappyEyeballs(
 			ctx, tlsCfg, quicCfg,
 			cfg.EndpointV4, cfg.EndpointV6,
 			connectPort, cfg.connectUri(), protector,
@@ -516,8 +528,8 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 		errChan := make(chan error, 2)
 		var wg sync.WaitGroup
 		wg.Add(2)
-		go func() { defer wg.Done(); forwardUp(device, ipConn, pool, errChan, dns) }()
-		go func() { defer wg.Done(); forwardDown(device, ipConn, pool, errChan) }()
+		go func() { defer wg.Done(); forwardUp(device, ipConn, pool, errChan, dns, dnsCache) }()
+		go func() { defer wg.Done(); forwardDown(device, ipConn, pool, errChan, dnsCache) }()
 
 		isNetworkReconnect := false
 		select {
@@ -737,7 +749,7 @@ func connectTunnelProtected(
 	return udpConn, tr, hconn, ipConn, rsp, nil
 }
 
-func forwardUp(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetBuffer, errChan chan<- error, dns *dnsInterceptor) {
+func forwardUp(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetBuffer, errChan chan<- error, dns *dnsInterceptor, dnsCache *tunnelDnsCache) {
 	for {
 		buf := pool.Get()
 		n, err := device.ReadPacket(buf)
@@ -775,6 +787,21 @@ func forwardUp(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetBuf
 			}
 		}
 
+		// Cache-only DNS interception (non-DoH mode)
+		if dnsCache != nil {
+			if _, _, _, _, ok := isAnyDNSPacket(pkt); ok {
+				if dnsCache.checkAndRespond(pkt, device.WritePacket) {
+					pool.Put(buf)
+					continue
+				}
+			} else if _, _, _, _, ok := isAnyDNSv6Packet(pkt); ok {
+				if dnsCache.checkAndRespond(pkt, device.WritePacket) {
+					pool.Put(buf)
+					continue
+				}
+			}
+		}
+
 		// Send via Connect-IP datagrams (UDP, ICMP, TCP, etc.)
 		icmp, err := ipConn.WritePacket(pkt)
 		pool.Put(buf)
@@ -788,7 +815,7 @@ func forwardUp(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetBuf
 	}
 }
 
-func forwardDown(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetBuffer, errChan chan<- error) {
+func forwardDown(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetBuffer, errChan chan<- error, dnsCache *tunnelDnsCache) {
 	buf := pool.Get()
 	defer pool.Put(buf)
 	for {
@@ -798,6 +825,9 @@ func forwardDown(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetB
 			return
 		}
 		rxBytes.Add(int64(n))
+		if dnsCache != nil {
+			dnsCache.cacheResponse(buf[:n])
+		}
 		if err := device.WritePacket(buf[:n]); err != nil {
 			errChan <- err
 			return
