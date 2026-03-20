@@ -289,6 +289,11 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch { prefs.setDohUrl(url) }
     }
 
+    fun setDoqUrl(url: String) {
+        markRestartNeeded()
+        viewModelScope.launch { prefs.setDoqUrl(url) }
+    }
+
     fun setCustomSni(sni: String) {
         markRestartNeeded()
         viewModelScope.launch { prefs.setCustomSni(sni) }

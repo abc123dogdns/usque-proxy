@@ -66,6 +66,7 @@ type tunnelConfig struct {
 	SNI         string   `json:"sni"`
 	ConnectURI  string   `json:"connect_uri"`
 	DoHURL      string   `json:"doh_url"`
+	DoQURL      string   `json:"doq_url"`
 	NetworkType string   `json:"network_type"`
 	SystemDNS   []string `json:"system_dns"`
 }
@@ -426,6 +427,12 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 		if dns != nil {
 			defer dns.close()
 			log.Println("DNS interception enabled: all port 53 traffic via DoH")
+		}
+	} else if cfg.DoQURL != "" {
+		dns = newDoqDnsInterceptor(ctx, cfg.DoQURL, protector)
+		if dns != nil {
+			defer dns.close()
+			log.Println("DNS interception enabled: all port 53 traffic via DoQ")
 		}
 	} else if len(cfg.SystemDNS) > 0 {
 		dns = newSystemDnsInterceptor(ctx, cfg.SystemDNS, protector)

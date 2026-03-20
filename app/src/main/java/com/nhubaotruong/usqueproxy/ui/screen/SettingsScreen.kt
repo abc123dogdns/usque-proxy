@@ -204,8 +204,9 @@ fun SettingsScreen(viewModel: VpnViewModel) {
             val dnsModes = DnsMode.entries
             val dnsLabelMap = mapOf(
                 DnsMode.SYSTEM to "System",
-                DnsMode.CLOUDFLARE to "Cloudflare",
-                DnsMode.CUSTOM_DOH to "Custom DoH",
+                DnsMode.CLOUDFLARE to "CF",
+                DnsMode.CUSTOM_DOH to "DoH",
+                DnsMode.CUSTOM_DOQ to "DoQ",
             )
             SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
                 dnsModes.forEachIndexed { index, mode ->
@@ -229,6 +230,22 @@ fun SettingsScreen(viewModel: VpnViewModel) {
                     },
                     label = { Text("DoH URL") },
                     placeholder = { Text("https://dns.google/dns-query") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                )
+            }
+            if (prefs.dnsMode == DnsMode.CUSTOM_DOQ) {
+                Spacer(Modifier.height(8.dp))
+                var doqUrl by remember(prefs.doqUrl) { mutableStateOf(prefs.doqUrl) }
+                OutlinedTextField(
+                    value = doqUrl,
+                    onValueChange = {
+                        doqUrl = it
+                        viewModel.setDoqUrl(it)
+                    },
+                    label = { Text("DoQ Server") },
+                    placeholder = { Text("dns.adguard-dns.com") },
+                    supportingText = { Text("Enter hostname (port 853 is used by default)") },
                     modifier = Modifier.fillMaxWidth(),
                     singleLine = true,
                 )

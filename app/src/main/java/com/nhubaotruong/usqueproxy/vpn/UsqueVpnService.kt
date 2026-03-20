@@ -214,6 +214,11 @@ class UsqueVpnService : VpnService() {
                 builder.addDnsServer("2606:4700:4700::1111")
                 config.put("doh_url", prefs.dohUrl)
             }
+            DnsMode.CUSTOM_DOQ -> {
+                builder.addDnsServer("1.1.1.1")
+                builder.addDnsServer("2606:4700:4700::1111")
+                config.put("doq_url", prefs.doqUrl)
+            }
         }
 
         // Pass current network type for adaptive keepalive

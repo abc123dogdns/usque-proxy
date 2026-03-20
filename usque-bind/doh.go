@@ -14,8 +14,11 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
 	"golang.org/x/net/http2"
 )
 
@@ -38,6 +41,13 @@ type dohProxy struct {
 	refreshing sync.Map             // cache keys currently being background-refreshed
 	makeClient func() *http.Client  // factory for recreating client on network errors
 	preferGET  bool                 // flip to true on HTTP 405, stay on GET
+
+	// HTTP/3 support
+	h3Client     *http.Client
+	h3ClientMu   sync.Mutex
+	useH3        atomic.Bool
+	h3Probed     atomic.Bool
+	makeH3Client func() *http.Client // factory for H3 client
 }
 
 type cacheEntry struct {
@@ -161,12 +171,63 @@ func newDohProxy(url string, protector VpnProtector) *dohProxy {
 		}
 	}
 
+	makeH3Client := func() *http.Client {
+		h3Transport := &http3.Transport{
+			DisableCompression: true,
+			TLSClientConfig: &tls.Config{
+				MinVersion:             tls.VersionTLS13,
+				ClientSessionCache:     globalTLSSessionCache,
+			},
+			Dial: func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
+				udpAddr, err := net.ResolveUDPAddr("udp", addr)
+				if err != nil {
+					return nil, err
+				}
+				localAddr := &net.UDPAddr{IP: net.IPv4zero, Port: 0}
+				if udpAddr.IP.To4() == nil {
+					localAddr = &net.UDPAddr{IP: net.IPv6zero, Port: 0}
+				}
+				udpConn, err := net.ListenUDP("udp", localAddr)
+				if err != nil {
+					return nil, err
+				}
+				// Protect socket from VPN routing
+				rawConn, err := udpConn.SyscallConn()
+				if err != nil {
+					udpConn.Close()
+					return nil, err
+				}
+				var protectErr error
+				rawConn.Control(func(fd uintptr) {
+					if !protector.ProtectFd(int(fd)) {
+						protectErr = errors.New("VPN protect() failed for H3 socket")
+					}
+				})
+				if protectErr != nil {
+					udpConn.Close()
+					return nil, protectErr
+				}
+				if cfg == nil {
+					cfg = &quic.Config{}
+				}
+				cfg.MaxIdleTimeout = 90 * time.Second
+				cfg.KeepAlivePeriod = 30 * time.Second
+				return quic.Dial(ctx, udpConn, udpAddr, tlsCfg, cfg)
+			},
+		}
+		return &http.Client{
+			Transport: h3Transport,
+			Timeout:   10 * time.Second,
+		}
+	}
+
 	return &dohProxy{
-		url:        url,
-		protector:  protector,
-		client:     makeClient(),
-		makeClient: makeClient,
-		cache:      newLRUCache(1024),
+		url:          url,
+		protector:    protector,
+		client:       makeClient(),
+		makeClient:   makeClient,
+		makeH3Client: makeH3Client,
+		cache:        newLRUCache(1024),
 	}
 }
 
@@ -246,10 +307,8 @@ func (d *dohProxy) resolve(query []byte) ([]byte, error) {
 	return body, nil
 }
 
-// fetchFromServer sends a DNS query to the DoH server with retries and returns the raw response.
-func (d *dohProxy) fetchFromServer(query []byte) ([]byte, error) {
-	padded := padQuery(query)
-
+// fetchWithClient sends a DNS query using the given HTTP client with retries.
+func (d *dohProxy) fetchWithClient(client *http.Client, padded []byte) ([]byte, error) {
 	const maxRetries = 3
 	var resp *http.Response
 	var lastErr error
@@ -265,14 +324,14 @@ func (d *dohProxy) fetchFromServer(query []byte) ([]byte, error) {
 			return nil, err
 		}
 
-		resp, err = d.client.Do(req)
+		resp, err = client.Do(req)
 		if err != nil {
 			lastErr = err
 			if isRetryableError(err) {
 				continue
 			}
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				if attempt == maxRetries-1 {
+				if attempt == maxRetries-1 && client == d.client {
 					d.resetClient()
 				}
 				continue
@@ -308,6 +367,60 @@ func (d *dohProxy) fetchFromServer(query []byte) ([]byte, error) {
 	}
 
 	return body, nil
+}
+
+// fetchFromServer sends a DNS query to the DoH server, preferring HTTP/3 when available.
+func (d *dohProxy) fetchFromServer(query []byte) ([]byte, error) {
+	padded := padQuery(query)
+
+	// Try HTTP/3 if enabled
+	if d.useH3.Load() {
+		d.h3ClientMu.Lock()
+		h3c := d.h3Client
+		d.h3ClientMu.Unlock()
+		if h3c != nil {
+			body, err := d.fetchWithClient(h3c, padded)
+			if err == nil {
+				return body, nil
+			}
+			log.Printf("DoH H3 request failed, falling back to H2: %v", err)
+			d.useH3.Store(false)
+			d.h3Probed.Store(false)
+		}
+	}
+
+	// Use HTTP/2
+	body, err := d.fetchWithClient(d.client, padded)
+	if err != nil {
+		return nil, err
+	}
+
+	// Probe H3 in background if not yet probed
+	if !d.h3Probed.Load() {
+		d.h3Probed.Store(true)
+		go d.probeH3()
+	}
+
+	return body, nil
+}
+
+// probeH3 tests whether the DoH server supports HTTP/3 by sending a warmup query.
+func (d *dohProxy) probeH3() {
+	d.h3ClientMu.Lock()
+	if d.h3Client == nil {
+		d.h3Client = d.makeH3Client()
+	}
+	h3c := d.h3Client
+	d.h3ClientMu.Unlock()
+
+	padded := padQuery(warmupQuery)
+	_, err := d.fetchWithClient(h3c, padded)
+	if err != nil {
+		log.Printf("DoH H3 probe failed (will keep using H2): %v", err)
+		return
+	}
+	log.Println("DoH server supports HTTP/3, switching")
+	d.useH3.Store(true)
 }
 
 // backgroundRefresh fetches a fresh response for the given cache key and updates the cache.
@@ -532,10 +645,20 @@ func computePaddingSize(currentLen int) int {
 }
 
 // resetClient recreates the HTTP client, discarding stale connections.
+// Also resets H3 state to force a re-probe on new network.
 func (d *dohProxy) resetClient() {
 	d.clientMu.Lock()
-	defer d.clientMu.Unlock()
 	d.client = d.makeClient()
+	d.clientMu.Unlock()
+
+	d.h3ClientMu.Lock()
+	if d.h3Client != nil {
+		d.h3Client.CloseIdleConnections()
+		d.h3Client = nil
+	}
+	d.h3ClientMu.Unlock()
+	d.useH3.Store(false)
+	d.h3Probed.Store(false)
 }
 
 // ipChecksum computes the IPv4 header checksum.
