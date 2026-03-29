@@ -130,11 +130,13 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
 
     fun disconnect() {
         val ctx = getApplication<Application>()
-        // Use broadcast instead of startService — startService() fails on Android 8+
-        // when app is in background, but broadcasts work reliably.
-        val intent = Intent(UsqueVpnService.ACTION_STOP_BROADCAST)
-        ctx.sendBroadcast(intent)
-        // State will be updated by UsqueVpnService.events → Stopped event
+        val intent = Intent(ctx, UsqueVpnService::class.java).apply {
+            action = UsqueVpnService.ACTION_STOP
+        }
+        ctx.startService(intent)
+        _vpnState.value = VpnState.DISCONNECTED
+        _connectedSince.value = null
+        _needsRestart.value = false
     }
 
     fun restartVpn() {

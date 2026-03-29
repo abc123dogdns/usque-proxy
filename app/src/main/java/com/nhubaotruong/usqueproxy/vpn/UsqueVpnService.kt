@@ -4,10 +4,8 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
-import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import android.content.IntentFilter
 import android.net.ConnectivityManager
 import android.net.IpPrefix
 import android.net.Network
@@ -45,7 +43,6 @@ class UsqueVpnService : VpnService() {
     companion object {
         const val TAG = "UsqueVpnService"
         const val ACTION_STOP = "com.nhubaotruong.usqueproxy.STOP_VPN"
-        const val ACTION_STOP_BROADCAST = "com.nhubaotruong.usqueproxy.STOP_VPN_BROADCAST"
         const val ACTION_RESTART = "com.nhubaotruong.usqueproxy.RESTART_VPN"
         const val CHANNEL_ID = "vpn_channel"
         const val NOTIFICATION_ID = 1
@@ -101,7 +98,6 @@ class UsqueVpnService : VpnService() {
     private var tunnelThread: Thread? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var startJob: kotlinx.coroutines.Job? = null
-    private var stopReceiver: BroadcastReceiver? = null
     @Volatile
     private var currentNetwork: Network? = null
     @Volatile
@@ -133,10 +129,6 @@ class UsqueVpnService : VpnService() {
                 lifecycleExecutor.execute { stopVpnInternal() }
                 return START_NOT_STICKY
             }
-            ACTION_STOP_BROADCAST -> {
-                lifecycleExecutor.execute { stopVpnInternal() }
-                return START_NOT_STICKY
-            }
             ACTION_RESTART -> {
                 startForeground(NOTIFICATION_ID, buildNotification())
                 lifecycleExecutor.execute {
@@ -147,7 +139,6 @@ class UsqueVpnService : VpnService() {
             }
         }
 
-        registerStopReceiver()
         startForeground(NOTIFICATION_ID, buildNotification())
         launchStartJob()
         return START_NOT_STICKY
@@ -169,27 +160,6 @@ class UsqueVpnService : VpnService() {
             }
 
             startVpn(prefs)
-        }
-    }
-
-    private fun registerStopReceiver() {
-        if (stopReceiver != null) return
-        val receiver = object : BroadcastReceiver() {
-            override fun onReceive(context: Context, intent: Intent) {
-                if (intent.action == ACTION_STOP_BROADCAST) {
-                    lifecycleExecutor.execute { stopVpnInternal() }
-                }
-            }
-        }
-        val filter = IntentFilter(ACTION_STOP_BROADCAST)
-        registerReceiver(receiver, filter)
-        stopReceiver = receiver
-    }
-
-    private fun unregisterStopReceiver() {
-        stopReceiver?.let {
-            runCatching { unregisterReceiver(it) }
-            stopReceiver = null
         }
     }
 
@@ -436,7 +406,6 @@ class UsqueVpnService : VpnService() {
             startJob = null
             reconnectHandler.removeCallbacks(reconnectRunnable)
             unregisterNetworkCallback()
-            unregisterStopReceiver()
             Usquebind.stopTunnel()
             tunnelThread?.let { t ->
                 t.join(5000)
