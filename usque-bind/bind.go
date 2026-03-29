@@ -21,6 +21,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"syscall"
 	"sync/atomic"
 	"time"
 
@@ -180,14 +181,23 @@ func StartTunnel(configJSON string, tunFd int, protector VpnProtector) error {
 	rxBytes.Store(0)
 	mu.Unlock()
 
-	tunFile := os.NewFile(uintptr(tunFd), "tun")
+	// Dup the fd so Go owns an independent copy. Without this, Go's GC
+	// finalizer can close the *original* fd after Kotlin hands it to a new
+	// VPN interface (fd number reuse), killing the new tunnel on reconnect.
+	// With dup, Go closes its copy and Kotlin closes the original — no race.
+	dupFd, dupErr := syscall.Dup(tunFd)
+	if dupErr != nil {
+		mu.Lock()
+		running.Store(false)
+		close(done)
+		mu.Unlock()
+		return fmt.Errorf("dup tun fd: %w", dupErr)
+	}
+	tunFile := os.NewFile(uintptr(dupFd), "tun")
 	device := &FdAdapter{file: tunFile}
 
 	err := maintainTunnel(ctx, &tcfg, device, protector)
-	// Close explicitly to unregister the GC finalizer. Without this, the
-	// finalizer can close a *reused* fd number after Kotlin hands a new VPN
-	// interface to the next StartTunnel call, killing the new tunnel.
-	tunFile.Close()
+	tunFile.Close() // closes Go's dup'd fd, not Kotlin's original
 	running.Store(false)
 	close(done)
 	return err
