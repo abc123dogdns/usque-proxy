@@ -38,6 +38,7 @@ const (
 	ZeroTrustSNI  = "zt-masque.cloudflareclient.com"
 	defaultURI    = "https://cloudflareaccess.com"
 	defaultLocale = "en_US"
+	tunnelMTU     = 1280 // must match mtu constant in maintainTunnel
 )
 
 // quicSessionCache enables TLS session resumption across QUIC reconnects (1-RTT, not 0-RTT).
@@ -120,8 +121,9 @@ var (
 	cancel      context.CancelFunc
 	running     atomic.Bool
 	connected   atomic.Bool  // true when MASQUE tunnel is forwarding traffic
-	done        chan struct{} // closed when maintainTunnel returns
-	reconnectCh chan struct{}
+	done           chan struct{} // closed when maintainTunnel returns
+	reconnectCh    chan struct{}
+	connectivityCh chan struct{} // signalled by SetConnectivity(true) to wake waitForNetwork
 	startTime   time.Time
 	connectedAt atomic.Int64 // unix millis when last connected (0 if not connected)
 	txBytes     atomic.Int64
@@ -165,6 +167,7 @@ func StartTunnel(configJSON string, tunFd int, protector VpnProtector) error {
 	cancel = c
 	done = make(chan struct{})
 	reconnectCh = make(chan struct{}, 1)
+	connectivityCh = make(chan struct{}, 1)
 	running.Store(true)
 	connected.Store(false)
 	networkTriggered.Store(false)
@@ -216,7 +219,16 @@ func SetNetworkHint(hint string) {
 func SetConnectivity(networkAvailable bool) {
 	wasConnected := hasNetwork.Swap(networkAvailable)
 	if networkAvailable && !wasConnected {
-		// Network restored — trigger reconnect to pick up the new network
+		// Network restored — wake waitForNetwork (if blocked) and trigger reconnect.
+		mu.Lock()
+		ch := connectivityCh
+		mu.Unlock()
+		if ch != nil {
+			select {
+			case ch <- struct{}{}:
+			default:
+			}
+		}
 		Reconnect()
 	}
 }
@@ -783,6 +795,14 @@ func forwardUp(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetBuf
 		pkt := buf[:n]
 		txBytes.Add(int64(n))
 
+		// Fast path: cheap version+protocol+port check before the full IP-extracting parse.
+		// ~95% of packets are not DNS — this avoids all allocations for that majority.
+		if dns != nil || dnsCache != nil {
+			if _, isDNS := isDNSPacketFast(pkt); !isDNS {
+				goto sendPacket
+			}
+		}
+
 		// Intercept DNS packets (IPv4 and IPv6)
 		if srcIP, srcPort, dstIP, query, isIPv6, ok := detectDNSQuery(pkt); ok {
 			if dns != nil {
@@ -802,6 +822,7 @@ func forwardUp(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetBuf
 			}
 		}
 
+	sendPacket:
 		// Send via Connect-IP datagrams (UDP, ICMP, TCP, etc.)
 		icmp, err := ipConn.WritePacket(pkt)
 		pool.Put(buf)
@@ -815,9 +836,10 @@ func forwardUp(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetBuf
 	}
 }
 
-func forwardDown(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetBuffer, errChan chan<- error, dnsCache *tunnelDnsCache) {
-	buf := pool.Get()
-	defer pool.Put(buf)
+func forwardDown(device api.TunnelDevice, ipConn *connectip.Conn, _ *api.NetBuffer, errChan chan<- error, dnsCache *tunnelDnsCache) {
+	// Allocate directly instead of using the pool: this buffer lives for the
+	// entire connection lifetime, so pool Get/Put mutex overhead is wasted.
+	buf := make([]byte, tunnelMTU)
 	for {
 		n, err := ipConn.ReadPacket(buf, true)
 		if err != nil {
@@ -878,22 +900,54 @@ func protectUDPConn(conn *net.UDPConn, protector VpnProtector) error {
 	return protectErr
 }
 
-// waitForNetwork blocks until hasNetwork becomes true or ctx is cancelled.
-// Polls every 500ms — SetConnectivity(true) also triggers Reconnect() which
-// will wake the select in maintainTunnel if we're past the connection phase.
+// waitForNetwork blocks until SetConnectivity(true) is called or ctx is cancelled.
+// Uses a channel signal instead of polling — zero CPU wakeups while waiting.
 func waitForNetwork(ctx context.Context) {
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if hasNetwork.Load() {
-				return
-			}
-		}
+	if hasNetwork.Load() {
+		return // already have network, no need to block
 	}
+	mu.Lock()
+	ch := connectivityCh
+	mu.Unlock()
+	if ch == nil {
+		return
+	}
+	select {
+	case <-ctx.Done():
+	case <-ch:
+	}
+}
+
+// isDNSPacketFast is a zero-allocation check for whether pkt is a UDP packet to port 53.
+// Checks only version nibble, protocol byte, and destination port — no IP extraction.
+// Call this before detectDNSQuery to skip allocations for the ~95% of non-DNS packets.
+// Returns (isIPv6 bool, ok bool).
+func isDNSPacketFast(pkt []byte) (isIPv6 bool, ok bool) {
+	if len(pkt) < 8 {
+		return false, false
+	}
+	version := pkt[0] >> 4
+	switch version {
+	case 4: // IPv4
+		if len(pkt) < 28 || pkt[9] != 17 { // 17 = UDP
+			return false, false
+		}
+		ihl := int(pkt[0]&0x0f) * 4
+		if len(pkt) < ihl+4 {
+			return false, false
+		}
+		// Destination port at ihl+2
+		dstPort := uint16(pkt[ihl+2])<<8 | uint16(pkt[ihl+3])
+		return false, dstPort == 53
+	case 6: // IPv6
+		if len(pkt) < 48 || pkt[6] != 17 { // next header must be UDP directly
+			return false, false
+		}
+		// UDP header at offset 40; destination port at 42
+		dstPort := uint16(pkt[42])<<8 | uint16(pkt[43])
+		return true, dstPort == 53
+	}
+	return false, false
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) {

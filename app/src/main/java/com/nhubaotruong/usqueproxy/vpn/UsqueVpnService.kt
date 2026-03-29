@@ -130,6 +130,8 @@ class UsqueVpnService : VpnService() {
 
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val lifecycleMutex = Mutex()
+    @Volatile
+    private var lastStartId = 0
 
     private val powerManager by lazy { getSystemService(Context.POWER_SERVICE) as PowerManager }
     private val connectWakeLock by lazy {
@@ -253,6 +255,7 @@ class UsqueVpnService : VpnService() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        lastStartId = startId
         when {
             // OS restarted service after process death — restore tunnel from prefs
             intent == null -> {
@@ -262,13 +265,14 @@ class UsqueVpnService : VpnService() {
                 return START_STICKY
             }
             intent.action == ACTION_STOP -> {
-                serviceScope.launch { stopVpnInternal() }
+                val capturedStartId = startId
+                serviceScope.launch { stopVpnInternal(capturedStartId) }
                 return START_NOT_STICKY
             }
             intent.action == ACTION_RESTART -> {
                 startForeground(NOTIFICATION_ID, buildNotification())
                 serviceScope.launch {
-                    stopVpnInternal()
+                    stopVpnInternal(stopService = false)
                     yield() // allow cancellation between stop and start
                     launchStartJob()
                 }
@@ -617,8 +621,14 @@ class UsqueVpnService : VpnService() {
     /**
      * Performs full VPN shutdown. Serialized via [lifecycleMutex] to prevent
      * concurrent start/stop races.
+     *
+     * @param stopStartId if non-null, calls stopSelf(startId) — Android will only
+     *   destroy the service if no newer onStartCommand arrived (prevents the
+     *   stop→start-quickly race from killing a freshly-started service).
+     * @param stopService if false, skips stopForeground/stopSelf entirely
+     *   (used by ACTION_RESTART which will immediately re-start).
      */
-    private suspend fun stopVpnInternal() {
+    private suspend fun stopVpnInternal(stopStartId: Int? = null, stopService: Boolean = true) {
         // Cancel startJob BEFORE acquiring mutex to avoid deadlock:
         // startJob holds mutex during setup, stop needs mutex for teardown.
         startJob?.cancel()
@@ -644,9 +654,22 @@ class UsqueVpnService : VpnService() {
         isRunning = false
         _events.tryEmit(VpnServiceEvent.Stopped)
         VpnTileService.requestUpdate(this)
-        withContext(Dispatchers.Main) {
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
+        if (stopService) {
+            // Check if a newer start arrived while we were tearing down — if so,
+            // don't kill the service or remove foreground status.
+            val shouldStop = stopStartId == null || stopStartId >= lastStartId
+            if (shouldStop) {
+                withContext(Dispatchers.Main) {
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    if (stopStartId != null) {
+                        stopSelf(stopStartId)
+                    } else {
+                        stopSelf()
+                    }
+                }
+            } else {
+                Log.i(TAG, "Skipping stopSelf: newer start (id=$lastStartId) arrived after stop (id=$stopStartId)")
+            }
         }
         } finally {
             isManagedShutdown = false
@@ -693,20 +716,23 @@ class UsqueVpnService : VpnService() {
         val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         val dynamicExclusions = mutableListOf<IpPrefix>()
 
-        // Discover actual local network subnets from all non-VPN, non-cellular networks
+        // Discover actual local network subnets from the active network's link properties.
+        // Uses the active network (which is what matters for local LAN access) instead of
+        // the deprecated ConnectivityManager.allNetworks.
         runCatching {
-            for (network in cm.allNetworks) {
-                val caps = cm.getNetworkCapabilities(network) ?: continue
-                if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) continue
-                val lp = cm.getLinkProperties(network) ?: continue
-                for (la in lp.linkAddresses) {
-                    val addr = la.address
-                    val prefix = la.prefixLength
-                    // Only include private/link-local addresses
-                    if (addr.isLinkLocalAddress || addr.isSiteLocalAddress ||
-                        addr.isLoopbackAddress || isPrivateAddress(addr)
-                    ) {
-                        dynamicExclusions.add(IpPrefix(addr, prefix))
+            val activeNetwork = cm.activeNetwork
+            if (activeNetwork != null) {
+                val lp = cm.getLinkProperties(activeNetwork)
+                if (lp != null) {
+                    for (la in lp.linkAddresses) {
+                        val addr = la.address
+                        val prefix = la.prefixLength
+                        // Only include private/link-local addresses
+                        if (addr.isLinkLocalAddress || addr.isSiteLocalAddress ||
+                            addr.isLoopbackAddress || isPrivateAddress(addr)
+                        ) {
+                            dynamicExclusions.add(IpPrefix(addr, prefix))
+                        }
                     }
                 }
             }
