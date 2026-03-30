@@ -1,5 +1,6 @@
 package com.nhubaotruong.usqueproxy.vpn
 
+import android.app.AlarmManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -20,6 +21,10 @@ import android.os.ParcelFileDescriptor
 import android.os.PowerManager
 import android.os.SystemClock
 import android.util.Log
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 import com.nhubaotruong.usqueproxy.MainActivity
 import com.nhubaotruong.usqueproxy.R
 import com.nhubaotruong.usqueproxy.data.Office365Endpoints
@@ -56,10 +61,17 @@ class UsqueVpnService : VpnService() {
         const val TAG = "UsqueVpnService"
         const val ACTION_STOP = "com.nhubaotruong.usqueproxy.STOP_VPN"
         const val ACTION_RESTART = "com.nhubaotruong.usqueproxy.RESTART_VPN"
+        const val ACTION_KEEPALIVE_ALARM = "com.nhubaotruong.usqueproxy.KEEPALIVE_ALARM"
         const val CHANNEL_ID = "vpn_channel"
         const val NOTIFICATION_ID = 1
         private const val WATCHDOG_INTERVAL_MS = 60_000L
         private const val ERROR_GRACE_TICKS = 3 // suppress errors for 3 watchdog intervals (~3 min)
+        // Doze-proof keepalive: primary (ScheduledExecutor, 2 min) + fallback (AlarmManager, 8 min).
+        // The executor fires reliably with battery-optimization exemption (partial wake lock honored).
+        // The alarm fires during Doze maintenance windows even without exemption.
+        private const val KEEPALIVE_INTERVAL_MS = 2 * 60 * 1000L   // 2 minutes
+        private const val KEEPALIVE_ALARM_INTERVAL_MS = 8 * 60 * 1000L // 8 minutes
+        private const val KEEPALIVE_DEBOUNCE_MS = 60_000L           // skip if fired within 60s
 
         @Volatile
         var isRunning = false
@@ -134,6 +146,13 @@ class UsqueVpnService : VpnService() {
     @Volatile
     private var screenOffAt: Long = 0L
 
+    // Doze-proof keepalive infrastructure (Tasks 4 & 5)
+    private var keepaliveExecutor: ScheduledExecutorService? = null
+    // Shared debounce timestamp between ScheduledExecutor and AlarmManager receiver.
+    // Prevents double-probing when both fire within KEEPALIVE_DEBOUNCE_MS of each other.
+    private val lastKeepaliveTimeMs = AtomicLong(0L)
+    private var keepaliveAlarmPi: PendingIntent? = null
+
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val lifecycleMutex = Mutex()
     @Volatile
@@ -189,6 +208,42 @@ class UsqueVpnService : VpnService() {
     private val reconnectWakeLock by lazy {
         powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "UsqueProxy:reconnect")
             .apply { setReferenceCounted(false) }
+    }
+
+    // AlarmManager-based keepalive receiver (Task 5).
+    // Registered/unregistered dynamically in onCreate/onDestroy — scoped to service lifetime.
+    private val alarmReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action != ACTION_KEEPALIVE_ALARM || !isRunning) {
+                rescheduleAlarm()
+                return
+            }
+            val now = SystemClock.elapsedRealtime()
+            if (now - lastKeepaliveTimeMs.get() < KEEPALIVE_DEBOUNCE_MS) {
+                Log.d(TAG, "AlarmManager keepalive debounced")
+                rescheduleAlarm()
+                return
+            }
+            lastKeepaliveTimeMs.set(now)
+            reconnectWakeLock.acquire(10_000L)
+            try {
+                val alive = Usquebind.keepalive()
+                Log.d(TAG, "AlarmManager keepalive: alive=$alive")
+                if (!alive && isRunning) {
+                    Log.i(TAG, "AlarmManager keepalive probe failed — triggering reconnect")
+                    Usquebind.reconnect()
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "AlarmManager keepalive exception: ${e.message}")
+            } finally {
+                if (reconnectWakeLock.isHeld) reconnectWakeLock.release()
+            }
+            rescheduleAlarm()
+        }
+
+        private fun rescheduleAlarm() {
+            if (isRunning) scheduleKeepaliveAlarm()
+        }
     }
 
     private val reconnectHandler = Handler(Looper.getMainLooper())
@@ -304,6 +359,11 @@ class UsqueVpnService : VpnService() {
                 addAction(PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED)
                 addAction(PowerManager.ACTION_POWER_SAVE_MODE_CHANGED)
             },
+            Context.RECEIVER_NOT_EXPORTED
+        )
+        registerReceiver(
+            alarmReceiver,
+            IntentFilter(ACTION_KEEPALIVE_ALARM),
             Context.RECEIVER_NOT_EXPORTED
         )
         isDeviceIdle = powerManager.isDeviceIdleMode
@@ -557,6 +617,8 @@ class UsqueVpnService : VpnService() {
 
         registerNetworkCallback()
         startWatchdog()
+        startKeepaliveExecutor()
+        scheduleKeepaliveAlarm()
     }
 
     private fun startWatchdog() {
@@ -565,12 +627,92 @@ class UsqueVpnService : VpnService() {
         lastWatchdogTxAtStallStart = -1L
         watchdogStallCount = 0
         rxStallCount = 0
+        errorGraceCount = 0
         reconnectHandler.removeCallbacks(watchdogRunnable)
         reconnectHandler.postDelayed(watchdogRunnable, WATCHDOG_INTERVAL_MS)
     }
 
     private fun stopWatchdog() {
         reconnectHandler.removeCallbacks(watchdogRunnable)
+    }
+
+    // --- Doze-proof keepalive (Tasks 4 & 5) ---
+
+    /**
+     * Starts a [ScheduledExecutorService] that fires every 2 minutes.
+     * Each tick acquires a partial wake lock (~1-2s), calls [Usquebind.keepalive] to
+     * probe the QUIC session, and reconnects if the probe detects a dead session.
+     *
+     * With battery-optimization exemption (prompted in MainActivity), partial wake
+     * locks are honoured even during Doze — keeping this 2-min interval reliable.
+     * Without exemption, tasks may be deferred; the [AlarmManager] fallback covers that.
+     */
+    private fun startKeepaliveExecutor() {
+        keepaliveExecutor?.shutdownNow()
+        lastKeepaliveTimeMs.set(0L)
+        keepaliveExecutor = Executors.newSingleThreadScheduledExecutor { r ->
+            Thread(r, "usque-keepalive").also { it.isDaemon = true }
+        }.also { exec ->
+            exec.scheduleAtFixedRate({
+                if (!isRunning) return@scheduleAtFixedRate
+                val now = SystemClock.elapsedRealtime()
+                if (now - lastKeepaliveTimeMs.get() < KEEPALIVE_DEBOUNCE_MS) {
+                    Log.d(TAG, "Keepalive executor debounced")
+                    return@scheduleAtFixedRate
+                }
+                lastKeepaliveTimeMs.set(now)
+                reconnectWakeLock.acquire(10_000L)
+                try {
+                    val alive = Usquebind.keepalive()
+                    Log.d(TAG, "Keepalive executor probe: alive=$alive")
+                    if (!alive && isRunning) {
+                        Log.i(TAG, "Keepalive executor: dead session detected — triggering reconnect")
+                        Usquebind.reconnect()
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Keepalive executor exception: ${e.message}")
+                } finally {
+                    if (reconnectWakeLock.isHeld) reconnectWakeLock.release()
+                }
+            }, KEEPALIVE_INTERVAL_MS, KEEPALIVE_INTERVAL_MS, TimeUnit.MILLISECONDS)
+        }
+    }
+
+    private fun stopKeepaliveExecutor() {
+        keepaliveExecutor?.shutdownNow()
+        keepaliveExecutor = null
+    }
+
+    /**
+     * Schedules an [AlarmManager.setExactAndAllowWhileIdle] alarm as a belt-and-suspenders
+     * fallback for users without battery-optimization exemption.
+     *
+     * [setExactAndAllowWhileIdle] fires during Doze maintenance windows even without exemption,
+     * though OEMs typically throttle it to once per ~9 minutes.
+     *
+     * The alarm is one-shot — [alarmReceiver] re-schedules it after each fire.
+     */
+    private fun scheduleKeepaliveAlarm() {
+        val am = getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        val intent = Intent(ACTION_KEEPALIVE_ALARM)
+        val pi = PendingIntent.getBroadcast(
+            this, 0, intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        keepaliveAlarmPi = pi
+        am.setExactAndAllowWhileIdle(
+            AlarmManager.ELAPSED_REALTIME_WAKEUP,
+            SystemClock.elapsedRealtime() + KEEPALIVE_ALARM_INTERVAL_MS,
+            pi,
+        )
+    }
+
+    private fun cancelKeepaliveAlarm() {
+        keepaliveAlarmPi?.let { pi ->
+            val am = getSystemService(Context.ALARM_SERVICE) as AlarmManager
+            am.cancel(pi)
+            keepaliveAlarmPi = null
+        }
     }
 
     /**
@@ -699,6 +841,8 @@ class UsqueVpnService : VpnService() {
         updateNotification("Disconnecting...")
         reconnectHandler.removeCallbacks(reconnectRunnable)
         stopWatchdog()
+        stopKeepaliveExecutor()
+        cancelKeepaliveAlarm()
         unregisterNetworkCallback()
         Usquebind.stopTunnel()
         // Wait up to 3s for tunnel to shut down gracefully; cancel if it hangs
@@ -739,7 +883,10 @@ class UsqueVpnService : VpnService() {
     override fun onDestroy() {
         reconnectHandler.removeCallbacks(reconnectRunnable)
         stopWatchdog()
+        stopKeepaliveExecutor()
+        cancelKeepaliveAlarm()
         runCatching { unregisterReceiver(idleModeReceiver) }
+        runCatching { unregisterReceiver(alarmReceiver) }
         // Synchronous cleanup: stop tunnel and cancel scope
         Usquebind.stopTunnel()
         tunnelJob?.cancel()
@@ -753,6 +900,8 @@ class UsqueVpnService : VpnService() {
         // Synchronous cleanup — onRevoke may be followed immediately by onDestroy
         reconnectHandler.removeCallbacks(reconnectRunnable)
         stopWatchdog()
+        stopKeepaliveExecutor()
+        cancelKeepaliveAlarm()
         unregisterNetworkCallback()
         Usquebind.stopTunnel()
         tunnelJob?.cancel()

@@ -274,6 +274,44 @@ func IsRunning() bool {
 	return running.Load()
 }
 
+// Keepalive probes the current tunnel connection without tearing it down.
+// Returns true if the tunnel appears alive, false if the session has likely
+// expired (triggers Reconnect automatically in that case).
+//
+// Called from Kotlin on periodic wake-ups (ScheduledExecutor or AlarmManager)
+// to detect sessions killed by Android Doze blocking UDP keepalives.
+//
+// Detection logic: if both rx and tx have been silent for longer than the
+// cellular idle timeout (120s), the QUIC session is likely dead server-side.
+// Idle connections (no apps sending traffic) have the same signature but also
+// have no tx — the 125s threshold is a conservative proxy for "Doze killed it."
+func Keepalive() bool {
+	if !running.Load() {
+		return false
+	}
+	if !connected.Load() {
+		// Tunnel is running but not connected — already in reconnect loop.
+		return false
+	}
+
+	rxNs := lastRxTime.Load()
+	txNs := lastTxTime.Load()
+	if rxNs > 0 && txNs > 0 {
+		rxAge := time.Since(time.Unix(0, rxNs))
+		txAge := time.Since(time.Unix(0, txNs))
+		// Threshold slightly above cellular MaxIdleTimeout (120s) so we reconnect
+		// before the server closes the session on its end.
+		const idleThreshold = 125 * time.Second
+		if rxAge > idleThreshold && txAge > idleThreshold {
+			log.Printf("keepalive: session idle for %.0fs/%.0fs (rx/tx) > %.0fs — reconnecting",
+				rxAge.Seconds(), txAge.Seconds(), idleThreshold.Seconds())
+			Reconnect()
+			return false
+		}
+	}
+	return true
+}
+
 // GetStats returns JSON with tunnel statistics.
 func GetStats() string {
 	now := time.Now()
@@ -535,12 +573,19 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 			hint = v.(string)
 		}
 
+		// Adaptive keepalive: more aggressive on cellular to survive shorter idle timeouts.
+		// WiFi: 55s keepalive (was 110s), 300s idle timeout.
+		// Cellular: 25s keepalive (was 50s), 120s idle timeout.
+		// Shorter cellular idle timeout means faster detection when the session dies
+		// server-side; Keepalive() uses the 120s threshold as a reconnect trigger.
 		keepalive := 55 * time.Second
+		idleTimeout := 300 * time.Second
 		switch hint {
 		case "wifi":
-			keepalive = 110 * time.Second
+			// keepalive and idleTimeout already set to wifi defaults above
 		case "cellular":
-			keepalive = 50 * time.Second
+			keepalive = 25 * time.Second
+			idleTimeout = 120 * time.Second
 		}
 
 		disablePMTU := true
@@ -554,7 +599,7 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 			EnableDatagrams:         true,
 			InitialPacketSize:       pktSize,
 			KeepAlivePeriod:         keepalive,
-			MaxIdleTimeout:          300 * time.Second,
+			MaxIdleTimeout:          idleTimeout,
 			DisablePathMTUDiscovery: disablePMTU,
 		}
 
