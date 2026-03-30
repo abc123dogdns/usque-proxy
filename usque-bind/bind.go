@@ -548,8 +548,11 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 			if err != nil {
 				lastError.Store(err.Error())
 				log.Printf("cert generation: %v", err)
-				sleepCtx(ctx, backoff)
-				backoff = nextBackoff(backoff, maxBackoff)
+				if sleepCtxReconnectable(ctx, backoff, reconnectCh) {
+					backoff = minBackoff
+				} else {
+					backoff = nextBackoff(backoff, maxBackoff)
+				}
 				continue
 			}
 			cachedCert = cert
@@ -560,8 +563,11 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 		if err != nil {
 			lastError.Store(err.Error())
 			log.Printf("TLS config: %v", err)
-			sleepCtx(ctx, backoff)
-			backoff = nextBackoff(backoff, maxBackoff)
+			if sleepCtxReconnectable(ctx, backoff, reconnectCh) {
+				backoff = minBackoff
+			} else {
+				backoff = nextBackoff(backoff, maxBackoff)
+			}
 			continue
 		}
 
@@ -618,8 +624,11 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 				waitForNetwork(ctx)
 				backoff = minBackoff
 			} else {
-				sleepCtx(ctx, backoff)
-				backoff = nextBackoff(backoff, maxBackoff)
+				if sleepCtxReconnectable(ctx, backoff, reconnectCh) {
+					backoff = minBackoff
+				} else {
+					backoff = nextBackoff(backoff, maxBackoff)
+				}
 			}
 			continue
 		}
@@ -627,8 +636,11 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 			lastError.Store(fmt.Sprintf("tunnel rejected: %s", rsp.Status))
 			log.Printf("tunnel rejected: %s", rsp.Status)
 			cleanup(ipConn, udpConn, tr)
-			sleepCtx(ctx, backoff)
-			backoff = nextBackoff(backoff, maxBackoff)
+			if sleepCtxReconnectable(ctx, backoff, reconnectCh) {
+				backoff = minBackoff
+			} else {
+				backoff = nextBackoff(backoff, maxBackoff)
+			}
 			continue
 		}
 
@@ -642,6 +654,13 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 		lastRxTime.Store(now)
 		lastTxTime.Store(now)
 		log.Println("Connected to MASQUE server")
+
+		// Drain any reconnect signal accumulated during retry loop so it doesn't
+		// immediately disconnect the freshly established connection.
+		select {
+		case <-reconnectCh:
+		default:
+		}
 
 		// Per-connection context: cancelled when this connection ends, which stops
 		// the liveness goroutine immediately without waiting for its next tick.
@@ -689,7 +708,10 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 		}
 
 		if backoff > 0 {
-			sleepCtx(ctx, backoff)
+			if sleepCtxReconnectable(ctx, backoff, reconnectCh) {
+				backoff = minBackoff
+				continue // skip backoff escalation, retry immediately
+			}
 		}
 		if networkGraceAttempts > 0 {
 			networkGraceAttempts--
@@ -1083,5 +1105,20 @@ func sleepCtx(ctx context.Context, d time.Duration) {
 	select {
 	case <-ctx.Done():
 	case <-timer.C:
+	}
+}
+
+// sleepCtxReconnectable is like sleepCtx but also wakes on a reconnect signal.
+// Returns true if woken by rch (caller should reset backoff), false otherwise.
+func sleepCtxReconnectable(ctx context.Context, d time.Duration, rch <-chan struct{}) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return false
+	case <-rch:
+		return true
 	}
 }

@@ -72,6 +72,7 @@ class UsqueVpnService : VpnService() {
         private const val KEEPALIVE_INTERVAL_MS = 2 * 60 * 1000L   // 2 minutes
         private const val KEEPALIVE_ALARM_INTERVAL_MS = 8 * 60 * 1000L // 8 minutes
         private const val KEEPALIVE_DEBOUNCE_MS = 60_000L           // skip if fired within 60s
+        private const val MAX_KEEPALIVE_FAILURES = 3              // 3 × 2min = 6min before full restart
 
         @Volatile
         var isRunning = false
@@ -147,6 +148,7 @@ class UsqueVpnService : VpnService() {
     private var screenOffAt: Long = 0L
 
     // Doze-proof keepalive infrastructure (Tasks 4 & 5)
+    @Volatile private var consecutiveKeepaliveFailures = 0
     private var keepaliveExecutor: ScheduledExecutorService? = null
     // Shared debounce timestamp between ScheduledExecutor and AlarmManager receiver.
     // Prevents double-probing when both fire within KEEPALIVE_DEBOUNCE_MS of each other.
@@ -230,8 +232,19 @@ class UsqueVpnService : VpnService() {
                 val alive = Usquebind.keepalive()
                 Log.d(TAG, "AlarmManager keepalive: alive=$alive")
                 if (!alive && isRunning) {
-                    Log.i(TAG, "AlarmManager keepalive probe failed — triggering reconnect")
-                    Usquebind.reconnect()
+                    consecutiveKeepaliveFailures++
+                    if (consecutiveKeepaliveFailures >= MAX_KEEPALIVE_FAILURES && !Usquebind.isRunning()) {
+                        Log.w(TAG, "AlarmManager: Go tunnel exited — triggering full VPN restart")
+                        consecutiveKeepaliveFailures = 0
+                        startService(Intent(this@UsqueVpnService, UsqueVpnService::class.java).apply {
+                            action = ACTION_RESTART
+                        })
+                    } else {
+                        Log.i(TAG, "AlarmManager keepalive: dead session ($consecutiveKeepaliveFailures/$MAX_KEEPALIVE_FAILURES) — reconnecting")
+                        Usquebind.reconnect()
+                    }
+                } else {
+                    consecutiveKeepaliveFailures = 0
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "AlarmManager keepalive exception: ${e.message}")
@@ -650,6 +663,7 @@ class UsqueVpnService : VpnService() {
     private fun startKeepaliveExecutor() {
         keepaliveExecutor?.shutdownNow()
         lastKeepaliveTimeMs.set(0L)
+        consecutiveKeepaliveFailures = 0
         keepaliveExecutor = Executors.newSingleThreadScheduledExecutor { r ->
             Thread(r, "usque-keepalive").also { it.isDaemon = true }
         }.also { exec ->
@@ -666,8 +680,19 @@ class UsqueVpnService : VpnService() {
                     val alive = Usquebind.keepalive()
                     Log.d(TAG, "Keepalive executor probe: alive=$alive")
                     if (!alive && isRunning) {
-                        Log.i(TAG, "Keepalive executor: dead session detected — triggering reconnect")
-                        Usquebind.reconnect()
+                        consecutiveKeepaliveFailures++
+                        if (consecutiveKeepaliveFailures >= MAX_KEEPALIVE_FAILURES && !Usquebind.isRunning()) {
+                            Log.w(TAG, "Go tunnel exited — triggering full VPN restart")
+                            consecutiveKeepaliveFailures = 0
+                            startService(Intent(this@UsqueVpnService, UsqueVpnService::class.java).apply {
+                                action = ACTION_RESTART
+                            })
+                        } else {
+                            Log.i(TAG, "Keepalive: dead session ($consecutiveKeepaliveFailures/$MAX_KEEPALIVE_FAILURES) — reconnecting")
+                            Usquebind.reconnect()
+                        }
+                    } else {
+                        consecutiveKeepaliveFailures = 0
                     }
                 } catch (e: Exception) {
                     Log.w(TAG, "Keepalive executor exception: ${e.message}")
