@@ -121,7 +121,10 @@ class UsqueVpnService : VpnService() {
     @Volatile
     private var isDeviceIdle = false
     private var lastWatchdogRxTx: Long = 0L
+    private var lastWatchdogRx: Long = 0L   // tracks rx_bytes separately for one-way stall detection
+    private var lastWatchdogTxAtStallStart: Long = -1L // tx snapshot when rx stall began (-1 = no stall)
     private var watchdogStallCount: Int = 0
+    private var rxStallCount: Int = 0       // consecutive intervals with rx frozen but tx active
     private var errorGraceCount: Int = 0 // suppress transient errors during reconnect
     private var lastSurfacedError: String = ""
     @Volatile
@@ -244,7 +247,36 @@ class UsqueVpnService : VpnService() {
                     updateNotification("Reconnecting...")
                 }
 
-                // Stuck detection: tunnel says connected but no traffic for 2+ intervals
+                val rxBytes = stats.optLong("rx_bytes", 0)
+                val txBytes = stats.optLong("tx_bytes", 0)
+
+                // One-way stall detection: rx frozen while tx is active.
+                // This catches the case where Cloudflare silently stops forwarding — the
+                // server drops our packets but the QUIC connection stays alive (keepalives
+                // work at transport level). Combined rxTx would keep changing (tx active),
+                // so the old check below would never trigger. Track rx separately.
+                if (goConnected && rxBytes == lastWatchdogRx && txBytes > 0L) {
+                    // rx unchanged but tx is nonzero — potential one-way stall
+                    if (lastWatchdogTxAtStallStart < 0L) {
+                        lastWatchdogTxAtStallStart = txBytes // first interval of stall
+                    }
+                    val txGrew = txBytes > lastWatchdogTxAtStallStart
+                    if (txGrew) {
+                        rxStallCount++
+                        if (rxStallCount >= 2) { // 2 intervals = ~2 min backup trigger
+                            Log.w(TAG, "One-way stall: rx frozen for ${rxStallCount * WATCHDOG_INTERVAL_MS / 1000}s while tx active, triggering reconnect")
+                            Usquebind.reconnect()
+                            rxStallCount = 0
+                            lastWatchdogTxAtStallStart = -1L
+                        }
+                    }
+                } else {
+                    rxStallCount = 0
+                    lastWatchdogTxAtStallStart = -1L
+                }
+                lastWatchdogRx = rxBytes
+
+                // Total-stall detection (fallback): no traffic at all for 3+ intervals.
                 if (goConnected && rxTx > 0L && rxTx == lastWatchdogRxTx) {
                     watchdogStallCount++
                     if (watchdogStallCount >= 3) { // 3 intervals = ~3 min stall
@@ -529,7 +561,10 @@ class UsqueVpnService : VpnService() {
 
     private fun startWatchdog() {
         lastWatchdogRxTx = 0L
+        lastWatchdogRx = 0L
+        lastWatchdogTxAtStallStart = -1L
         watchdogStallCount = 0
+        rxStallCount = 0
         reconnectHandler.removeCallbacks(watchdogRunnable)
         reconnectHandler.postDelayed(watchdogRunnable, WATCHDOG_INTERVAL_MS)
     }
