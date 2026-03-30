@@ -4,6 +4,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.FilterList
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Settings
@@ -20,6 +21,7 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.repeatOnLifecycle
+import com.nhubaotruong.usqueproxy.ui.screen.DebugScreen
 import com.nhubaotruong.usqueproxy.ui.screen.MainScreen
 import com.nhubaotruong.usqueproxy.ui.screen.SettingsScreen
 import com.nhubaotruong.usqueproxy.ui.screen.SplitTunnelScreen
@@ -33,6 +35,7 @@ private val navItems = listOf(
     NavItem("Home", Icons.Default.Home),
     NavItem("Split Tunnel", Icons.Default.FilterList),
     NavItem("Settings", Icons.Default.Settings),
+    NavItem("Debug", Icons.Default.BugReport),
 )
 
 @Composable
@@ -80,6 +83,7 @@ fun AppNavigation(
                 )
                 1 -> SplitTunnelScreen(viewModel = viewModel)
                 2 -> SettingsScreen(viewModel = viewModel)
+                3 -> DebugScreen(viewModel = viewModel)
             }
         }
     }
