@@ -53,7 +53,6 @@ fun DebugScreen(viewModel: VpnViewModel) {
         item {
             DebugSectionHeader("Connection")
             DebugRow("State", if (stats.connected) "Connected" else "Disconnected")
-            DebugRow("Network", stats.networkHint.ifEmpty { "unknown" })
             DebugRow("Has network", if (stats.hasNetwork) "yes" else "no")
             DebugRow("Uptime", formatDebugUptime(stats.uptimeSec))
             DebugRow(

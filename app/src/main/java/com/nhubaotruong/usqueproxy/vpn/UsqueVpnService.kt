@@ -520,9 +520,6 @@ class UsqueVpnService : VpnService() {
             }
         }
 
-        // Pass current network type for adaptive keepalive
-        config.put("network_type", detectNetworkType())
-
         val configJson = config.toString()
 
         // Routes: catch-all + exclusions
@@ -752,7 +749,6 @@ class UsqueVpnService : VpnService() {
                 val previous = currentNetwork
                 currentNetwork = network
                 underlyingNetworkSet = false
-                cm.getNetworkCapabilities(network)?.let { updateNetworkHint(it) }
                 if (isRunning) {
                     setUnderlyingNetworks(arrayOf(network))
                     underlyingNetworkSet = true
@@ -793,7 +789,6 @@ class UsqueVpnService : VpnService() {
                     caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) {
                     underlyingNetworkSet = true
                     setUnderlyingNetworks(arrayOf(network))
-                    updateNetworkHint(caps)
                 }
             }
         }
@@ -1009,26 +1004,6 @@ class UsqueVpnService : VpnService() {
         lp.isPrivateDnsActive && lp.privateDnsServerName != null
     } catch (_: Exception) {
         false
-    }
-
-    private fun detectNetworkType(): String {
-        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        val network = cm.activeNetwork ?: return ""
-        val caps = cm.getNetworkCapabilities(network) ?: return ""
-        return when {
-            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "wifi"
-            caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "cellular"
-            else -> ""
-        }
-    }
-
-    private fun updateNetworkHint(caps: NetworkCapabilities) {
-        val hint = when {
-            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "wifi"
-            caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "cellular"
-            else -> ""
-        }
-        Usquebind.setNetworkHint(hint)
     }
 
     private fun getSystemDnsServers(): List<String> = try {

@@ -68,7 +68,6 @@ type tunnelConfig struct {
 	ConnectURI  string   `json:"connect_uri"`
 	DoHURL      string   `json:"doh_url"`
 	DoQURL      string   `json:"doq_url"`
-	NetworkType    string   `json:"network_type"`
 	SystemDNS      []string `json:"system_dns"`
 	PrivateDNS     bool     `json:"private_dns_active"`
 }
@@ -224,16 +223,6 @@ func StopTunnel() {
 // caused by a network change, so maintainTunnel can skip the initial backoff.
 var networkTriggered atomic.Bool
 
-// networkHint stores the current network type ("wifi", "cellular", or "")
-// for adaptive keepalive intervals. Updated from Kotlin via SetNetworkHint.
-var networkHint atomic.Value
-
-// SetNetworkHint updates the network type hint for adaptive keepalive.
-// Call from Kotlin on network change: "wifi", "cellular", or "" (unknown).
-func SetNetworkHint(hint string) {
-	networkHint.Store(hint)
-}
-
 // SetConnectivity tells the tunnel whether the device has network.
 // When false, the reconnect loop sleeps instead of hammering failed dials.
 // Call from Kotlin: true on onAvailable, false on onLost (no active network).
@@ -342,9 +331,6 @@ func GetStats() string {
 	}
 	if txNs := lastTxTime.Load(); txNs > 0 {
 		stats["last_tx_time_ms"] = txNs / int64(time.Millisecond)
-	}
-	if v := networkHint.Load(); v != nil {
-		stats["network_hint"] = v.(string)
 	}
 	b, _ := json.Marshal(stats)
 	return string(b)
@@ -472,7 +458,6 @@ func cleanEndpoint(ep string) string {
 func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDevice, protector VpnProtector) error {
 	const (
 		mtu             = 1280
-		packetSize      = 1242
 		connectPort     = 443
 		minBackoff      = 1 * time.Second
 		maxBackoff      = 60 * time.Second
@@ -527,11 +512,6 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 
 	const networkGraceMax = 3 // attempts at minBackoff after network change before escalating
 
-	// Seed network hint from config; Kotlin will update dynamically via SetNetworkHint.
-	if cfg.NetworkType != "" {
-		networkHint.Store(cfg.NetworkType)
-	}
-
 	backoff := minBackoff
 	networkGraceAttempts := 0
 
@@ -573,40 +553,12 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 
 		tlsCfg.ClientSessionCache = quicSessionCache // 1-RTT session resumption (not 0-RTT)
 
-		// Adaptive keepalive and PMTU based on network type
-		var hint string
-		if v := networkHint.Load(); v != nil {
-			hint = v.(string)
-		}
-
-		// Adaptive keepalive: more aggressive on cellular to survive shorter idle timeouts.
-		// WiFi: 55s keepalive (was 110s), 300s idle timeout.
-		// Cellular: 25s keepalive (was 50s), 120s idle timeout.
-		// Shorter cellular idle timeout means faster detection when the session dies
-		// server-side; Keepalive() uses the 120s threshold as a reconnect trigger.
-		keepalive := 55 * time.Second
-		idleTimeout := 300 * time.Second
-		switch hint {
-		case "wifi":
-			// keepalive and idleTimeout already set to wifi defaults above
-		case "cellular":
-			keepalive = 25 * time.Second
-			idleTimeout = 120 * time.Second
-		}
-
-		disablePMTU := true
-		pktSize := uint16(packetSize) // 1242
-		if hint == "wifi" {
-			disablePMTU = false
-			pktSize = 1400
-		}
-
 		quicCfg := &quic.Config{
 			EnableDatagrams:         true,
-			InitialPacketSize:       pktSize,
-			KeepAlivePeriod:         keepalive,
-			MaxIdleTimeout:          idleTimeout,
-			DisablePathMTUDiscovery: disablePMTU,
+			InitialPacketSize:       1280,
+			KeepAlivePeriod:         25 * time.Second,
+			MaxIdleTimeout:          120 * time.Second,
+			DisablePathMTUDiscovery: true,
 		}
 
 		connectCount.Add(1)

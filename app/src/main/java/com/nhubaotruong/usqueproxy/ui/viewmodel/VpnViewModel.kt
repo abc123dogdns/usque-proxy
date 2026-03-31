@@ -35,7 +35,6 @@ data class TunnelStats(
     val connectCount: Long = 0,
     val lastError: String = "",
     val rxStallSec: Int = 0,
-    val networkHint: String = "",
     val uptimeSec: Int = 0,
     val connectedSinceMs: Long = 0,
 )
@@ -132,7 +131,6 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             connectCount = json.optLong("connect_count", 0L),
             lastError = json.optString("last_error", ""),
             rxStallSec = json.optInt("rx_stall_sec", 0),
-            networkHint = json.optString("network_hint", ""),
             uptimeSec = uptimeSec,
             connectedSinceMs = connectedSinceMs,
         )
