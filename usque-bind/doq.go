@@ -236,6 +236,9 @@ func newDoqDnsInterceptor(ctx context.Context, doqAddr string, protector VpnProt
 			doq.resetConn()
 			doq.warmConnection()
 		},
+		closeFunc: func() {
+			doq.resetConn()
+		},
 	}
 	d.startWorkers(ctx, 4)
 

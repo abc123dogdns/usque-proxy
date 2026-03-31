@@ -543,8 +543,15 @@ func computePaddingSize(currentLen int) int {
 // Also resets H3 state to force a re-probe on new network.
 func (d *dohProxy) resetClient() {
 	d.clientMu.Lock()
+	old := d.client
 	d.client = d.makeClient()
 	d.clientMu.Unlock()
+
+	// Close idle connections on the old transport to release file descriptors
+	// immediately rather than waiting for IdleConnTimeout (300s).
+	if old != nil {
+		old.CloseIdleConnections()
+	}
 
 	d.h3ClientMu.Lock()
 	if d.h3Client != nil {
@@ -554,6 +561,21 @@ func (d *dohProxy) resetClient() {
 	d.h3ClientMu.Unlock()
 	d.useH3.Store(false)
 	d.h3Probed.Store(false)
+}
+
+// close releases HTTP client resources. Called when the tunnel stops.
+func (d *dohProxy) close() {
+	d.clientMu.Lock()
+	if d.client != nil {
+		d.client.CloseIdleConnections()
+	}
+	d.clientMu.Unlock()
+
+	d.h3ClientMu.Lock()
+	if d.h3Client != nil {
+		d.h3Client.CloseIdleConnections()
+	}
+	d.h3ClientMu.Unlock()
 }
 
 // ipChecksum computes the IPv4 header checksum.
@@ -656,6 +678,7 @@ type dnsInterceptor struct {
 	resolver  func(query []byte) ([]byte, error)
 	reqCh     chan dnsRequest
 	resetFunc func() // called on network change to discard stale connections
+	closeFunc func() // called on tunnel stop to release resources
 }
 
 // newDnsInterceptor creates a dnsInterceptor that resolves all DNS via DoH.
@@ -674,6 +697,9 @@ func newDnsInterceptor(ctx context.Context, cfg *tunnelConfig, protector VpnProt
 		resetFunc: func() {
 			doh.resetClient()
 			doh.warmConnection()
+		},
+		closeFunc: func() {
+			doh.close()
 		},
 	}
 	d.startWorkers(ctx, 4)
@@ -858,6 +884,9 @@ func newSystemDnsInterceptor(ctx context.Context, servers []string, protector Vp
 		resetFunc: func() {
 			resolver.pool.reset()
 		},
+		closeFunc: func() {
+			resolver.pool.reset()
+		},
 	}
 	d.startWorkers(ctx, 4)
 
@@ -892,8 +921,12 @@ func (d *dnsInterceptor) forwardUp(req dnsRequest) {
 	}
 }
 
-// close is a no-op (DoH client is GC'd with the interceptor).
-func (d *dnsInterceptor) close() {}
+// close releases DNS proxy resources when the tunnel stops.
+func (d *dnsInterceptor) close() {
+	if d.closeFunc != nil {
+		d.closeFunc()
+	}
+}
 
 // resetConnections discards stale DNS connections after a network change.
 func (d *dnsInterceptor) resetConnections() {

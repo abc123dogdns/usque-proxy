@@ -136,6 +136,12 @@ var (
 	// stops forwarding (rx frozen) while the client is still sending (tx active).
 	lastRxTime atomic.Int64 // Unix nanos of last received IP packet from tunnel
 	lastTxTime atomic.Int64 // Unix nanos of last IP packet written to tunnel
+
+	// Packet counters for delivery ratio monitoring.
+	txPackets          atomic.Int64
+	rxPackets          atomic.Int64
+	lastDeliveryRatio  atomic.Int64 // ratio × 100 (e.g. 95 = 95%), -1 = not enough data
+	lifetimeRotations  atomic.Int64 // number of max-lifetime forced reconnects
 )
 
 // StartTunnel starts the MASQUE tunnel. Blocks until StopTunnel or error.
@@ -185,6 +191,10 @@ func StartTunnel(configJSON string, tunFd int, protector VpnProtector) error {
 	rxBytes.Store(0)
 	lastRxTime.Store(0)
 	lastTxTime.Store(0)
+	txPackets.Store(0)
+	rxPackets.Store(0)
+	lastDeliveryRatio.Store(-1)
+	lifetimeRotations.Store(0)
 	mu.Unlock()
 
 	// Dup the fd so Go owns an independent copy. Without this, Go's GC
@@ -332,6 +342,10 @@ func GetStats() string {
 	if txNs := lastTxTime.Load(); txNs > 0 {
 		stats["last_tx_time_ms"] = txNs / int64(time.Millisecond)
 	}
+	stats["tx_packets"] = txPackets.Load()
+	stats["rx_packets"] = rxPackets.Load()
+	stats["delivery_ratio"] = lastDeliveryRatio.Load()
+	stats["lifetime_rotations"] = lifetimeRotations.Load()
 	b, _ := json.Marshal(stats)
 	return string(b)
 }
@@ -457,11 +471,12 @@ func cleanEndpoint(ep string) string {
 // directly because it calls ConnectTunnel without a protect() hook.
 func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDevice, protector VpnProtector) error {
 	const (
-		mtu             = 1280
-		connectPort     = 443
-		minBackoff      = 1 * time.Second
-		maxBackoff      = 60 * time.Second
-		certRenewBefore = 1 * time.Hour // renew cert 1h before expiry
+		mtu              = 1280
+		connectPort      = 443
+		minBackoff       = 1 * time.Second
+		maxBackoff       = 60 * time.Second
+		certRenewBefore  = 1 * time.Hour  // renew cert 1h before expiry
+		maxConnLifetime  = 2 * time.Hour  // force reconnect to prevent silent MASQUE degradation
 	)
 
 	privKey, err := cfg.GetEcPrivateKey()
@@ -625,6 +640,7 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 		go func() { defer wg.Done(); forwardDown(device, ipConn, pool, errChan, dnsCache) }()
 		go func() { defer wg.Done(); livenessCheck(connCtx) }()
 
+		lifetimeTimer := time.NewTimer(maxConnLifetime)
 		select {
 		case err = <-errChan:
 			connected.Store(false)
@@ -641,10 +657,17 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 			} else {
 				backoff = minBackoff
 			}
+		case <-lifetimeTimer.C:
+			connected.Store(false)
+			connectedAt.Store(0)
+			lifetimeRotations.Add(1)
+			log.Printf("max connection lifetime (%v) reached, rotating tunnel", maxConnLifetime)
+			backoff = 200 * time.Millisecond
 		case <-ctx.Done():
 			connected.Store(false)
 			connectedAt.Store(0)
 		}
+		lifetimeTimer.Stop()
 
 		connCancel() // stop liveness goroutine immediately
 		cleanup(ipConn, udpConn, tr)
@@ -894,6 +917,7 @@ func forwardUp(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetBuf
 			return
 		}
 		lastTxTime.Store(time.Now().UnixNano())
+		txPackets.Add(1)
 		if len(icmp) > 0 {
 			_ = device.WritePacket(icmp)
 		}
@@ -912,6 +936,7 @@ func forwardDown(device api.TunnelDevice, ipConn *connectip.Conn, _ *api.NetBuff
 		}
 		lastRxTime.Store(time.Now().UnixNano())
 		rxBytes.Add(int64(n))
+		rxPackets.Add(1)
 		if dnsCache != nil {
 			dnsCache.cacheResponse(buf[:n])
 		}
@@ -931,15 +956,25 @@ func forwardDown(device api.TunnelDevice, ipConn *connectip.Conn, _ *api.NetBuff
 // Stall condition: no rx packet for >30s AND tx packet within last 30s.
 // Idle connections (both rx and tx silent) do NOT trigger a reconnect.
 //
+// Also detects partial degradation: if the tunnel delivers <10% of expected
+// packets for 2 consecutive windows while actively sending, it reconnects.
+//
 // Exits immediately when ctx is cancelled (connection ended or reconnecting).
 func livenessCheck(ctx context.Context) {
 	const (
-		rxStallTimeout = 30 * time.Second
-		txActiveWindow = 30 * time.Second
-		checkInterval  = 10 * time.Second
+		rxStallTimeout            = 30 * time.Second
+		txActiveWindow            = 30 * time.Second
+		checkInterval             = 10 * time.Second
+		minTxForRatioCheck  int64 = 50   // need meaningful sample before evaluating ratio
+		degradedThreshold         = 0.10 // <10% delivery = degraded
+		degradedWindowsMax        = 2    // consecutive degraded windows to trigger reconnect
 	)
 	ticker := time.NewTicker(checkInterval)
 	defer ticker.Stop()
+
+	var prevTxPkts, prevRxPkts int64
+	var degradedCount int
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -953,6 +988,33 @@ func livenessCheck(ctx context.Context) {
 					rxAge.Seconds(), txAge.Seconds())
 				Reconnect()
 				return // one reconnect signal is enough; exit so we don't spam
+			}
+
+			// Delivery ratio check: detect partial degradation where some
+			// packets get through but many are dropped silently.
+			curTx := txPackets.Load()
+			curRx := rxPackets.Load()
+			windowTx := curTx - prevTxPkts
+			windowRx := curRx - prevRxPkts
+			prevTxPkts = curTx
+			prevRxPkts = curRx
+
+			if windowTx >= minTxForRatioCheck {
+				ratio := float64(windowRx) / float64(windowTx)
+				lastDeliveryRatio.Store(int64(ratio * 100))
+				if ratio < degradedThreshold {
+					degradedCount++
+					if degradedCount >= degradedWindowsMax {
+						log.Printf("liveness: degraded delivery ratio %.1f%% over %d windows — triggering reconnect",
+							ratio*100, degradedCount)
+						Reconnect()
+						return
+					}
+				} else {
+					degradedCount = 0
+				}
+			} else {
+				degradedCount = 0
 			}
 		}
 	}
