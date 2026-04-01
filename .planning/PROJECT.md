@@ -24,14 +24,14 @@ VPN tunnel connections must stay reliably alive for hours/days without silent de
 
 ### Active
 
-- [ ] Replace complex liveness detection with usque-android's simpler dual-goroutine error detection pattern
-- [ ] Adopt usque-android's CloseError-based immediate reconnection instead of multi-layer stall detection
-- [ ] Simplify reconnection strategy: constant retry delay instead of exponential backoff with jitter
+- [x] Replace complex liveness detection with usque-android's simpler dual-goroutine error detection pattern — Phase 1
+- [x] Adopt usque-android's CloseError-based immediate reconnection instead of multi-layer stall detection — Phase 1
+- [x] Simplify reconnection strategy: constant retry delay instead of exponential backoff with jitter — Phase 1
 - [ ] Remove 2-hour forced tunnel rotation (shouldn't be needed if forwarding loops detect death properly)
 - [ ] Remove delivery ratio monitoring (symptom-based detection replaced by cause-based detection)
 - [ ] Remove Android-side watchdog stall detection (Go-side forwarding loops handle this)
-- [ ] Clean resource teardown per reconnect cycle (match usque-android's cleanup pattern)
-- [ ] Verify QUIC keepalive period is sufficient (usque-android uses 30s, usque-proxy uses 25s)
+- [x] Clean resource teardown per reconnect cycle (match usque-android's cleanup pattern) — Phase 1
+- [x] Verify QUIC keepalive period is sufficient (usque-android uses 30s, usque-proxy uses 25s) — Phase 1
 
 ### Out of Scope
 
@@ -87,4 +87,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-04-01 after initialization*
+*Last updated: 2026-04-01 after Phase 1 completion*
