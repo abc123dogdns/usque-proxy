@@ -17,7 +17,7 @@ Revert all Go and Kotlin source files to the stable v1.27 baseline, then surgica
 
 Decimal phases appear between their surrounding integers in numeric order.
 
-- [ ] **Phase 1: Revert to v1.27 Baseline** - Restore all Go and Kotlin source files to their v1.27 state
+- [x] **Phase 1: Revert to v1.27 Baseline** - Restore all Go and Kotlin source files to their v1.27 state (completed 2026-04-01)
 - [ ] **Phase 2: Surgical CloseError Port** - Add CloseError detection in forwarding loops and constant reconnect delay
 
 ## Phase Details
@@ -50,5 +50,5 @@ Phases execute in numeric order: 1 -> 2
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Revert to v1.27 Baseline | 0/0 | Not started | - |
+| 1. Revert to v1.27 Baseline | 1/1 | Complete    | 2026-04-01 |
 | 2. Surgical CloseError Port | 0/0 | Not started | - |
