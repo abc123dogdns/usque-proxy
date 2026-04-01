@@ -806,11 +806,21 @@ func forwardUp(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetBuf
 		icmp, err := ipConn.WritePacket(pkt)
 		pool.Put(buf)
 		if err != nil {
-			errChan <- err
-			return
+			if errors.As(err, new(*connectip.CloseError)) {
+				errChan <- fmt.Errorf("connection closed while writing to IP connection: %v", err)
+				return
+			}
+			log.Printf("Error writing to IP connection: %v, continuing...", err)
+			continue
 		}
 		if len(icmp) > 0 {
-			_ = device.WritePacket(icmp)
+			if err := device.WritePacket(icmp); err != nil {
+				if errors.As(err, new(*connectip.CloseError)) {
+					errChan <- fmt.Errorf("connection closed while writing ICMP to TUN device: %v", err)
+					return
+				}
+				log.Printf("Error writing ICMP to TUN device: %v, continuing...", err)
+			}
 		}
 	}
 }
@@ -821,8 +831,12 @@ func forwardDown(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetB
 	for {
 		n, err := ipConn.ReadPacket(buf, true)
 		if err != nil {
-			errChan <- err
-			return
+			if errors.As(err, new(*connectip.CloseError)) {
+				errChan <- fmt.Errorf("connection closed while reading from IP connection: %v", err)
+				return
+			}
+			log.Printf("Error reading from IP connection: %v, continuing...", err)
+			continue
 		}
 		rxBytes.Add(int64(n))
 		if dnsCache != nil {
