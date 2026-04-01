@@ -2,11 +2,20 @@
 
 ## What This Is
 
-An Android VPN app (usque-proxy) that tunnels traffic through Cloudflare's MASQUE protocol using QUIC + Connect-IP. The app currently suffers from silent connection death after 2-4 hours — it reports "connected" but traffic stops flowing. The goal is to replace the current complex tunnel management approach with the simpler, proven pattern from usque-android, which doesn't suffer from this problem.
+An Android VPN app (usque-proxy) that tunnels traffic through Cloudflare's MASQUE protocol using QUIC + Connect-IP. The app suffers from silent connection death after 2-4 hours — it reports "connected" but traffic stops flowing. The goal is to surgically add CloseError-based reconnection from usque-android to the stable v1.27 codebase, keeping all existing mechanisms intact.
 
 ## Core Value
 
 VPN tunnel connections must stay reliably alive for hours/days without silent death — if the connection breaks, detect it immediately and reconnect.
+
+## Current Milestone: v1.1 Surgical CloseError Port
+
+**Goal:** Revert to v1.27 baseline, then port only CloseError-based reconnection and constant retry delay from usque-android
+
+**Target features:**
+- Revert all Go and Kotlin code to v1.27 state
+- Port CloseError detection in forwardUp/forwardDown (fatal vs non-fatal error classification)
+- Port constant reconnect delay (replace exponential backoff with 1s constant delay)
 
 ## Requirements
 
@@ -24,50 +33,47 @@ VPN tunnel connections must stay reliably alive for hours/days without silent de
 
 ### Active
 
-- [x] Replace complex liveness detection with usque-android's simpler dual-goroutine error detection pattern — Phase 1
-- [x] Adopt usque-android's CloseError-based immediate reconnection instead of multi-layer stall detection — Phase 1
-- [x] Simplify reconnection strategy: constant retry delay instead of exponential backoff with jitter — Phase 1
-- [ ] Remove 2-hour forced tunnel rotation (shouldn't be needed if forwarding loops detect death properly)
-- [ ] Remove delivery ratio monitoring (symptom-based detection replaced by cause-based detection)
-- [ ] Remove Android-side watchdog stall detection (Go-side forwarding loops handle this)
-- [x] Clean resource teardown per reconnect cycle (match usque-android's cleanup pattern) — Phase 1
-- [x] Verify QUIC keepalive period is sufficient (usque-android uses 30s, usque-proxy uses 25s) — Phase 1
+- [ ] Revert all Go and Kotlin code to v1.27 baseline
+- [ ] Port CloseError detection in forwardUp/forwardDown from usque-android
+- [ ] Port constant 1s reconnect delay (replace exponential backoff)
 
 ### Out of Scope
 
-- New features or UI changes — this is a reliability-focused refactor
-- DNS subsystem changes — DoH/DoQ works fine, only reset-on-reconnect matters
-- Android service lifecycle changes — Doze handling, battery exemption, alarm keepalive stay as-is
-- usque-rs (Rust library) changes — focus is on Go tunnel layer and Kotlin service
+- v1.0 Phase 2/3 work (complexity removal, compatibility verification) — deferred; taking minimal approach first
+- New features or UI changes — reliability-focused
+- DNS subsystem changes — works fine as-is
+- Keepalive/watchdog/rotation removal — keeping v1.27's existing mechanisms
+- usque-rs (Rust library) changes
 
 ## Context
 
-**The problem:** After 2-4 hours, the MASQUE session expires server-side while the QUIC transport layer stays alive (kept alive by QUIC keepalive packets). The app shows "connected" because the QUIC connection is healthy, but no IP traffic flows through the dead Connect-IP session.
+**v1.0 lesson learned:** Phase 1 made too many changes at once (Keepalive rework, DNS fast path, waitForNetwork rewrite, fd dup, adaptive keepalive removal, etc.). The minimal approach is better: start from the known-good v1.27, add only the two patterns that directly address the root cause.
 
-**Why usque-android works:** Its dual forwarding goroutines (TUN→server and server→TUN) immediately detect `connectip.CloseError` when trying to read/write on a dead session. This triggers instant reconnection. The error detection is at the forwarding layer, not a separate monitoring layer.
+**The root cause:** After 2-4 hours, the MASQUE session expires server-side while the QUIC transport stays alive. The app shows "connected" but no IP traffic flows.
 
-**Why usque-proxy's current approach is fragile:** It relies on *observing symptoms* (delivery ratio drops, rx stalls, watchdog byte counters) rather than *detecting the cause* (forwarding loop errors). This creates detection windows where traffic stops but the monitoring hasn't triggered yet. The complexity of multiple overlapping detection mechanisms (Go liveness goroutine, Android watchdog, keepalive probes, delivery ratio) makes the system harder to reason about and debug.
+**The fix (from usque-android):** Forwarding goroutines detect `connectip.CloseError` on read/write and trigger immediate reconnection. Non-fatal errors are logged but don't trigger reconnect. Constant 1s retry delay instead of exponential backoff.
 
-**Reference implementation:** `usque-android/api/tunnel.go` — `MaintainTunnel()` function (lines 146-256) is the gold standard for simple, reliable tunnel lifecycle management.
+**Reference:** `usque-android/api/tunnel.go` — `MaintainTunnel()` function
 
 **Key files to modify:**
-- `usque-bind/bind.go` — Go tunnel core (replace `maintainTunnel`, `livenessCheck`, reconnect logic)
-- `app/src/main/java/com/nhubaotruong/usqueproxy/vpn/UsqueVpnService.kt` — simplify watchdog, remove stall detection
+- `usque-bind/bind.go` — forwardUp/forwardDown error classification, reconnect delay
+- `app/src/main/java/com/nhubaotruong/usqueproxy/vpn/UsqueVpnService.kt` — revert to v1.27
 
 ## Constraints
 
 - **Tech stack**: Go (gomobile) + Kotlin, Android VPN service — no changes
 - **Protocol**: QUIC + MASQUE Connect-IP via quic-go and connect-ip-go libraries
 - **Compatibility**: Must maintain existing JNI interface (`Usquebind.startTunnel`, `getStats`, etc.)
-- **Android**: Keep Doze handling, battery exemption, network callbacks — these are Android-specific concerns the simpler Go approach doesn't affect
+- **Android**: Keep all v1.27 Doze handling, battery exemption, network callbacks, watchdog as-is
 
 ## Key Decisions
 
 | Decision | Rationale | Outcome |
 |----------|-----------|---------|
-| Port usque-android's approach over incremental fixes | Current complex approach has layered fixes that didn't solve the root cause; simpler pattern proven to work | — Pending |
-| Keep Android-side Doze/battery handling | These are platform concerns separate from tunnel reliability; usque-android doesn't run as Android service | — Pending |
-| Remove symptom-based detection (delivery ratio, stall counters) | Replace with cause-based detection (forwarding loop errors) | — Pending |
+| Revert to v1.27 instead of building on v1.38 | v1.0 Phase 1 changed too much at once; v1.27 is the stable baseline | v1.1 |
+| Port only CloseError + constant retry | Minimal surgical changes that address root cause without disrupting working mechanisms | v1.1 |
+| Keep v1.27's keepalive/watchdog/rotation | These may be redundant with CloseError detection, but removing them is a separate concern | v1.1 |
+| Defer complexity removal (v1.0 Phase 2/3) | Get the fix working first, then decide what to simplify | v1.1 |
 
 ## Evolution
 
@@ -87,4 +93,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-04-01 after Phase 1 completion*
+*Last updated: 2026-04-01 — Milestone v1.1 started*
