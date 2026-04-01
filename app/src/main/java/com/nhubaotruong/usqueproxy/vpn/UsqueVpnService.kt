@@ -522,7 +522,7 @@ class UsqueVpnService : VpnService() {
                 val previous = currentNetwork
                 currentNetwork = network
                 underlyingNetworkSet = false
-                cm.getNetworkCapabilities(network)?.let { updateNetworkHint(it) }
+
                 if (isRunning) {
                     setUnderlyingNetworks(arrayOf(network))
                     underlyingNetworkSet = true
@@ -563,7 +563,7 @@ class UsqueVpnService : VpnService() {
                     caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) {
                     underlyingNetworkSet = true
                     setUnderlyingNetworks(arrayOf(network))
-                    updateNetworkHint(caps)
+
                 }
             }
         }
@@ -763,14 +763,6 @@ class UsqueVpnService : VpnService() {
         }
     }
 
-    private fun updateNetworkHint(caps: NetworkCapabilities) {
-        val hint = when {
-            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "wifi"
-            caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "cellular"
-            else -> ""
-        }
-        Usquebind.setNetworkHint(hint)
-    }
 
     private fun getSystemDnsServers(): List<String> = try {
         val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
