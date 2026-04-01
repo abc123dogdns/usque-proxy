@@ -12,10 +12,10 @@
 
 ### CloseError Port
 
-- [ ] **CERR-01**: forwardUp detects `connectip.CloseError` on `ipConn.WritePacket` and sends fatal error to reconnect
-- [ ] **CERR-02**: forwardUp detects `connectip.CloseError` on ICMP `device.WritePacket` and sends fatal error to reconnect
-- [ ] **CERR-03**: forwardDown detects `connectip.CloseError` on `ipConn.ReadPacket` and sends fatal error to reconnect
-- [ ] **CERR-04**: Non-CloseError errors in forwarding loops are logged but do not trigger reconnection
+- [x] **CERR-01**: forwardUp detects `connectip.CloseError` on `ipConn.WritePacket` and sends fatal error to reconnect
+- [x] **CERR-02**: forwardUp detects `connectip.CloseError` on ICMP `device.WritePacket` and sends fatal error to reconnect
+- [x] **CERR-03**: forwardDown detects `connectip.CloseError` on `ipConn.ReadPacket` and sends fatal error to reconnect
+- [x] **CERR-04**: Non-CloseError errors in forwarding loops are logged but do not trigger reconnection
 
 ### Reconnect Delay
 
@@ -57,10 +57,10 @@
 |-------------|-------|--------|
 | REV-01 | Phase 1 | Pending |
 | REV-02 | Phase 1 | Pending |
-| CERR-01 | Phase 2 | Pending |
-| CERR-02 | Phase 2 | Pending |
-| CERR-03 | Phase 2 | Pending |
-| CERR-04 | Phase 2 | Pending |
+| CERR-01 | Phase 2 | Complete |
+| CERR-02 | Phase 2 | Complete |
+| CERR-03 | Phase 2 | Complete |
+| CERR-04 | Phase 2 | Complete |
 | RDLY-01 | Phase 2 | Pending |
 
 **Coverage:**

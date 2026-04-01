@@ -41,10 +41,10 @@ Decimal phases appear between their surrounding integers in numeric order.
   2. Non-CloseError packet errors (transient read/write failures) are logged but do not cause reconnection
   3. After tunnel death, reconnection retries use a constant 1-second delay instead of exponential backoff
   4. The app builds, produces a valid AAR, and the tunnel can be started on-device
-**Plans:** 2 plans
+**Plans:** 1/2 plans executed
 
 Plans:
-- [ ] 02-01-PLAN.md — Add CloseError classification to forwardUp and forwardDown
+- [x] 02-01-PLAN.md — Add CloseError classification to forwardUp and forwardDown
 - [ ] 02-02-PLAN.md — Replace backoff with constant delay, fix QUIC config, cleanup dead code, build AAR
 
 ## Progress
@@ -55,4 +55,4 @@ Phases execute in numeric order: 1 -> 2
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Revert to v1.27 Baseline | 1/1 | Complete    | 2026-04-01 |
-| 2. Surgical CloseError Port | 0/2 | Not started | - |
+| 2. Surgical CloseError Port | 1/2 | In Progress|  |
