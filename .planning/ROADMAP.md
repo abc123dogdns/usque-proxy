@@ -18,7 +18,7 @@ Revert all Go and Kotlin source files to the stable v1.27 baseline, then surgica
 Decimal phases appear between their surrounding integers in numeric order.
 
 - [x] **Phase 1: Revert to v1.27 Baseline** - Restore all Go and Kotlin source files to their v1.27 state (completed 2026-04-01)
-- [ ] **Phase 2: Surgical CloseError Port** - Add CloseError detection in forwarding loops and constant reconnect delay
+- [x] **Phase 2: Surgical CloseError Port** - Add CloseError detection in forwarding loops and constant reconnect delay (completed 2026-04-01)
 
 ## Phase Details
 
@@ -41,7 +41,7 @@ Decimal phases appear between their surrounding integers in numeric order.
   2. Non-CloseError packet errors (transient read/write failures) are logged but do not cause reconnection
   3. After tunnel death, reconnection retries use a constant 1-second delay instead of exponential backoff
   4. The app builds, produces a valid AAR, and the tunnel can be started on-device
-**Plans:** 1/2 plans executed
+**Plans:** 2/2 plans complete
 
 Plans:
 - [x] 02-01-PLAN.md — Add CloseError classification to forwardUp and forwardDown
@@ -55,4 +55,4 @@ Phases execute in numeric order: 1 -> 2
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Revert to v1.27 Baseline | 1/1 | Complete    | 2026-04-01 |
-| 2. Surgical CloseError Port | 1/2 | In Progress|  |
+| 2. Surgical CloseError Port | 1/2 | Complete    | 2026-04-01 |
