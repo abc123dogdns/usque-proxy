@@ -34,13 +34,8 @@ data class TunnelStats(
     val hasNetwork: Boolean = true,
     val connectCount: Long = 0,
     val lastError: String = "",
-    val rxStallSec: Int = 0,
     val uptimeSec: Int = 0,
     val connectedSinceMs: Long = 0,
-    val txPackets: Long = 0,
-    val rxPackets: Long = 0,
-    val deliveryRatio: Int = -1,
-    val lifetimeRotations: Long = 0,
 )
 
 class VpnViewModel(application: Application) : AndroidViewModel(application) {
@@ -134,13 +129,8 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             hasNetwork = json.optBoolean("has_network", true),
             connectCount = json.optLong("connect_count", 0L),
             lastError = json.optString("last_error", ""),
-            rxStallSec = json.optInt("rx_stall_sec", 0),
             uptimeSec = uptimeSec,
             connectedSinceMs = connectedSinceMs,
-            txPackets = json.optLong("tx_packets", 0L),
-            rxPackets = json.optLong("rx_packets", 0L),
-            deliveryRatio = json.optInt("delivery_ratio", -1),
-            lifetimeRotations = json.optLong("lifetime_rotations", 0L),
         )
         if (_connectedSince.value == null && uptimeSec > 0) {
             _connectedSince.value = System.currentTimeMillis() - uptimeSec * 1000L

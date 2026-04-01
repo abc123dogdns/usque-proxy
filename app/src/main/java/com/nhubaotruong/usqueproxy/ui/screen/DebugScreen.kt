@@ -69,18 +69,6 @@ fun DebugScreen(viewModel: VpnViewModel) {
             DebugSectionHeader("Traffic")
             DebugRow("TX", formatBytes(stats.txBytes))
             DebugRow("RX", formatBytes(stats.rxBytes))
-            DebugRow("TX packets", stats.txPackets.toString())
-            DebugRow("RX packets", stats.rxPackets.toString())
-            DebugRow(
-                "Delivery",
-                if (stats.deliveryRatio >= 0) "${stats.deliveryRatio}%" else "—",
-                highlight = stats.deliveryRatio in 0..49,
-            )
-            DebugRow(
-                "RX stall",
-                if (stats.connected && stats.rxStallSec > 0) "${stats.rxStallSec}s" else "—",
-                highlight = stats.connected && stats.rxStallSec >= 20,
-            )
             Spacer(Modifier.height(4.dp))
             HorizontalDivider()
         }
@@ -88,7 +76,6 @@ fun DebugScreen(viewModel: VpnViewModel) {
         item {
             DebugSectionHeader("Health")
             DebugRow("Reconnections", stats.connectCount.toString())
-            DebugRow("Lifetime rotations", stats.lifetimeRotations.toString())
             DebugRow(
                 "Last error",
                 stats.lastError.ifEmpty { "none" },
