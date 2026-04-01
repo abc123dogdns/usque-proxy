@@ -42,7 +42,7 @@
 
 | Feature | Reason |
 |---------|--------|
-| Keepalive/watchdog/rotation removal | Keeping v1.27's existing mechanisms — defer to future milestone |
+| Keepalive/watchdog/rotation removal | Keeping v1.27's existing mechanisms -- defer to future milestone |
 | DNS subsystem changes | Works fine as-is |
 | UI/UX changes | Reliability-focused |
 | usque-rs changes | Rust library is separate |
@@ -55,18 +55,18 @@
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| REV-01 | TBD | Pending |
-| REV-02 | TBD | Pending |
-| CERR-01 | TBD | Pending |
-| CERR-02 | TBD | Pending |
-| CERR-03 | TBD | Pending |
-| CERR-04 | TBD | Pending |
-| RDLY-01 | TBD | Pending |
+| REV-01 | Phase 1 | Pending |
+| REV-02 | Phase 1 | Pending |
+| CERR-01 | Phase 2 | Pending |
+| CERR-02 | Phase 2 | Pending |
+| CERR-03 | Phase 2 | Pending |
+| CERR-04 | Phase 2 | Pending |
+| RDLY-01 | Phase 2 | Pending |
 
 **Coverage:**
 - v1.1 requirements: 7 total
-- Mapped to phases: 0 (pending roadmap)
-- Unmapped: 7
+- Mapped to phases: 7
+- Unmapped: 0
 
 ---
 *Requirements defined: 2026-04-01*
