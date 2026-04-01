@@ -1,0 +1,97 @@
+# Technology Stack
+
+**Analysis Date:** 2026-04-01
+
+## Languages
+
+**Primary:**
+- Kotlin - Android application layer (`app/src/main/java/com/nhubaotruong/usqueproxy/`)
+- Go 1.24.2 - Native tunnel/VPN binding layer (`usque-bind/`, `usque-android/`)
+
+**Secondary:**
+- Rust (edition 2021) - Experimental MASQUE client reference implementation (`usque-rs/`)
+- Bash - Build automation (`build-usque.sh`)
+
+## Runtime
+
+**Environment:**
+- Android API 35 minimum, target API 36 (Android 15/16)
+- ABI: arm64-v8a only (see `app/build.gradle.kts` `ndk.abiFilters`)
+- JVM: Java 11 source/target compatibility
+
+**Package Manager:**
+- Gradle 9.4.1 (main app, `gradle/wrapper/gradle-wrapper.properties`)
+- Go modules (`usque-bind/go.mod`, `usque-android/go.mod`)
+- Cargo (`usque-rs/Cargo.toml`)
+- Lockfiles: `app/libs/usquebind.aar` (pre-built), `usque-bind/go.sum`, `usque-rs/Cargo.lock`
+
+## Frameworks
+
+**Core (Android):**
+- Jetpack Compose BOM `2026.03.00` - UI framework
+- Compose Material3 - UI component library
+- Compose Navigation `2.9.7` - In-app navigation
+- AndroidX Lifecycle `2.10.0` - ViewModel, lifecycle-aware coroutines
+- Kotlin Coroutines - Async/concurrent logic throughout VPN service
+
+**Build/Dev:**
+- Android Gradle Plugin (AGP) `9.1.0`
+- Kotlin Compose compiler plugin `2.3.20`
+- gomobile `v0.0.0-20250408133729-978277e7eaf7` - Generates `usquebind.aar` from Go code
+- gobind - Companion to gomobile for JVM bindings
+
+**Testing:**
+- JUnit 4 `4.13.2` - Unit tests
+- AndroidX Test (JUnit, Espresso `3.7.0`) - Instrumentation tests
+- Compose UI Test JUnit4 - Compose UI testing
+
+## Key Dependencies
+
+**Critical:**
+- `github.com/Diniboy1123/usque v1.4.2` - Core MASQUE/WARP protocol implementation (Go)
+- `github.com/Diniboy1123/connect-ip-go` - CONNECT-IP (RFC 9484) implementation (Go)
+- `github.com/quic-go/quic-go v0.59.0` - QUIC transport (Go), used for MASQUE tunnel and DoQ DNS
+- `gvisor.dev/gvisor` - Userspace networking stack for the TUN device
+- `golang.zx2c4.com/wireguard` - WireGuard networking primitives
+- `usquebind.aar` (local `app/libs/`) - Pre-built gomobile AAR providing `usquebind.Usquebind` and `usquebind.VpnProtector` to Kotlin
+
+**Infrastructure (Android):**
+- `androidx.datastore:datastore-preferences 1.2.1` - Persistent settings storage
+- `com.google.accompanist:accompanist-drawablepainter 0.37.3` - Drawable rendering in Compose
+- `androidx.compose.material:material-icons-extended` - Extended icon set
+
+**Rust (usque-rs, experimental):**
+- `quiche 0.22` with `boringssl-vendored` - QUIC + HTTP/3 (Cloudflare's library)
+- `tokio 1` - Async runtime
+- `reqwest 0.12` with `rustls-tls` - HTTPS client for WARP API registration
+- `rcgen 0.13`, `p256 0.13` - TLS certificate generation and ECDSA
+
+## Configuration
+
+**Environment:**
+- `keystore.properties` (git-ignored) - Contains `storeFile`, `storePassword`, `keyAlias`, `keyPassword` for release signing
+- `local.properties` (git-ignored) - Android SDK path
+- `gradle.properties` - JVM heap (`-Xmx2048m`), AndroidX flags, Gradle configuration cache enabled
+
+**Build:**
+- `gradle/libs.versions.toml` - Version catalog for all Android/Kotlin dependencies
+- `app/build.gradle.kts` - Single-module Android app build config; reads `keystore.properties` for signing
+- `build-usque.sh` - Invokes `gomobile bind` to produce `app/libs/usquebind.aar` from `usque-bind/`
+- PGO: optional profile-guided optimization if `usque-bind/default.pgo` exists
+
+## Platform Requirements
+
+**Development:**
+- JDK 17 (used in CI via `actions/setup-java`)
+- Go 1.24.2 (toolchain pinned via `GOTOOLCHAIN=go1.24.2`)
+- Android SDK: platforms `android-36`, `android-31`, build-tools `36.0.0`, NDK `28.0.13004108`
+- gomobile + gobind installed from `golang.org/x/mobile`
+- `build-usque.sh` must be run before `./gradlew assembleRelease` to produce the AAR
+
+**Production:**
+- Android 15+ (API 35) devices, arm64-v8a only
+- Release APK signed with provided keystore, distributed via GitHub Releases
+
+---
+
+*Stack analysis: 2026-04-01*
