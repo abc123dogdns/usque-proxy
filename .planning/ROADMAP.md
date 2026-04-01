@@ -31,7 +31,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 Plans:
 - [x] 01-01-PLAN.md — Rewrite forwarding loops with CloseError classification and simplify reconnect to constant 1s delay
-- [ ] 01-02-PLAN.md — Remove obsolete stats fields, dead code (nextBackoff, livenessCheck), and clean up Kotlin side
+- [x] 01-02-PLAN.md — Remove obsolete stats fields, dead code (nextBackoff, livenessCheck), and clean up Kotlin side
 
 ### Phase 2: Complexity Removal
 **Goal**: All obsolete monitoring and keepalive mechanisms are removed, leaving only the forwarding-loop-based detection
