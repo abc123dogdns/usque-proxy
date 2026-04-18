@@ -432,20 +432,42 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 
 		// Only reconnect when there is actual outbound traffic waiting.
 		// Prevents wasteful reconnects during idle periods.
+		// ReadPacket is blocking, so run it in a goroutine and select on
+		// reconnectCh too — otherwise a forced reconnect (network change)
+		// can't wake us when the app is in background with no outbound traffic.
 		if waitForTraffic {
 			log.Println("Tunnel idle. Waiting for outbound activity before reconnecting...")
-			buf := pool.Get()
-			n, err := device.ReadPacket(buf)
-			pool.Put(buf)
-			if err != nil {
-				if ctx.Err() != nil {
-					return nil
-				}
-				log.Printf("Failed to read from TUN while waiting for activity: %v", err)
-				sleepCtx(ctx, reconnectDelay)
-				continue
+			type readResult struct {
+				n   int
+				err error
 			}
-			log.Printf("Detected outbound activity (%d bytes). Reconnecting...", n)
+			readCh := make(chan readResult, 1)
+			buf := pool.Get()
+			go func() {
+				n, err := device.ReadPacket(buf)
+				pool.Put(buf)
+				readCh <- readResult{n, err}
+			}()
+
+			select {
+			case r := <-readCh:
+				if r.err != nil {
+					if ctx.Err() != nil {
+						return nil
+					}
+					log.Printf("Failed to read from TUN while waiting for activity: %v", r.err)
+					sleepCtx(ctx, reconnectDelay)
+					continue
+				}
+				log.Printf("Detected outbound activity (%d bytes). Reconnecting...", r.n)
+			case <-reconnectCh:
+				log.Println("Reconnect signal received while idle — reconnecting immediately")
+				// Goroutine is still blocked on ReadPacket; it will complete when the
+				// next TUN packet arrives (fd stays open) and return buf to pool.
+			case <-ctx.Done():
+				// Goroutine will unblock when TUN fd is closed during shutdown.
+				return nil
+			}
 			waitForTraffic = false
 		}
 
