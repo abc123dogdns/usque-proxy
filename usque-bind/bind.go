@@ -421,7 +421,8 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 	// Certificate cache: generate once, reuse until near expiry.
 	var cachedCert [][]byte
 	var certExpiry time.Time
-	var waitForTraffic bool // after error disconnect, wait for outbound traffic before reconnecting
+	var waitForTraffic bool   // after error disconnect, wait for outbound traffic before reconnecting
+	var forcedReconnect bool  // true when reconnect was explicitly requested (skip backoff delay)
 
 	for {
 		select {
@@ -560,6 +561,7 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 		go func() { defer wg.Done(); forwardUp(device, ipConn, pool, errChan, dns, dnsCache) }()
 		go func() { defer wg.Done(); forwardDown(device, ipConn, pool, errChan, dnsCache, cfg.UseHTTP2) }()
 
+		forcedReconnect = false
 		select {
 		case err = <-errChan:
 			connected.Store(false)
@@ -571,7 +573,8 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 			connected.Store(false)
 			connectedAt.Store(0)
 			log.Println("reconnect requested")
-			waitForTraffic = false // forced reconnect — connect immediately
+			waitForTraffic = false
+			forcedReconnect = true
 			// Reset DNS immediately so in-flight queries on stale connections
 			// fail fast instead of waiting for network timeouts.
 			if dns != nil {
@@ -583,7 +586,15 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 		}
 
 		cleanup(ipConn, udpConn, tr)
-		wg.Wait() // wait for forwarding goroutines to exit before reconnecting
+		// Wait for forwarding goroutines, but don't block forever:
+		// forwardUp may be stuck on device.ReadPacket if no TUN traffic.
+		wgDone := make(chan struct{})
+		go func() { wg.Wait(); close(wgDone) }()
+		select {
+		case <-wgDone:
+		case <-time.After(2 * time.Second):
+			log.Println("forwarders slow to stop, proceeding with reconnect")
+		}
 		if ctx.Err() != nil {
 			return nil
 		}
@@ -593,7 +604,8 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 			dns.resetConnections()
 		}
 
-		if !waitForTraffic {
+		// Only backoff-sleep after error disconnects, not forced reconnects
+		if !waitForTraffic && !forcedReconnect {
 			sleepCtx(ctx, reconnectDelay)
 		}
 	}

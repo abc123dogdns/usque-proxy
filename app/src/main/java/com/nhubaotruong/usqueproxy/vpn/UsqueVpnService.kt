@@ -610,10 +610,8 @@ class UsqueVpnService : VpnService() {
 
     private fun restartTunnel() {
         // Debounce rapid network changes (WiFi↔cellular) into a single reconnect.
-        // Double the delay in Power Save Mode to reduce wake-ups.
-        val delay = if (isPowerSaveMode) 4000L else 2000L
         reconnectHandler.removeCallbacks(reconnectRunnable)
-        reconnectHandler.postDelayed(reconnectRunnable, delay)
+        reconnectHandler.postDelayed(reconnectRunnable, 500L)
     }
 
     /**
