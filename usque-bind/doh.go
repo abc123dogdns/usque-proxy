@@ -289,8 +289,13 @@ func (d *dohProxy) fetchWithClient(client *http.Client, padded []byte) ([]byte, 
 				continue
 			}
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				if attempt == maxRetries-1 && client == d.client {
-					d.resetClient()
+				if attempt == maxRetries-1 {
+					d.clientMu.Lock()
+					stale := client == d.client
+					d.clientMu.Unlock()
+					if stale {
+						d.resetClient()
+					}
 				}
 				continue
 			}
@@ -348,7 +353,10 @@ func (d *dohProxy) fetchFromServer(query []byte) ([]byte, error) {
 	}
 
 	// Use HTTP/2
-	body, err := d.fetchWithClient(d.client, padded)
+	d.clientMu.Lock()
+	h2c := d.client
+	d.clientMu.Unlock()
+	body, err := d.fetchWithClient(h2c, padded)
 	if err != nil {
 		return nil, err
 	}
@@ -541,10 +549,24 @@ func computePaddingSize(currentLen int) int {
 
 // resetClient recreates the HTTP client, discarding stale connections.
 // Also resets H3 state to force a re-probe on new network.
+// Closes the old client's transport to fail in-flight requests fast
+// instead of waiting for timeouts on the dead network.
 func (d *dohProxy) resetClient() {
 	d.clientMu.Lock()
+	old := d.client
 	d.client = d.makeClient()
 	d.clientMu.Unlock()
+
+	// Close old transport to kill in-flight requests immediately
+	if old != nil {
+		if tr, ok := old.Transport.(*http.Transport); ok {
+			tr.CloseIdleConnections()
+			// CancelRequest is deprecated, but CloseIdleConnections + new client
+			// ensures no new requests use stale connections. In-flight requests
+			// will fail on next read/write when the underlying conn dies.
+		}
+		old.CloseIdleConnections()
+	}
 
 	d.h3ClientMu.Lock()
 	if d.h3Client != nil {

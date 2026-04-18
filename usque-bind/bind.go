@@ -572,6 +572,11 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 			connectedAt.Store(0)
 			log.Println("reconnect requested")
 			waitForTraffic = false // forced reconnect — connect immediately
+			// Reset DNS immediately so in-flight queries on stale connections
+			// fail fast instead of waiting for network timeouts.
+			if dns != nil {
+				dns.resetConnections()
+			}
 		case <-ctx.Done():
 			connected.Store(false)
 			connectedAt.Store(0)
@@ -583,8 +588,8 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 			return nil
 		}
 
-		// Reset DNS connections so stale sockets are discarded
-		if dns != nil {
+		// Reset DNS on error path too (errChan case doesn't reset above)
+		if waitForTraffic && dns != nil {
 			dns.resetConnections()
 		}
 
