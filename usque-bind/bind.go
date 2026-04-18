@@ -30,6 +30,7 @@ import (
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"github.com/yosida95/uritemplate/v3"
+	"golang.org/x/net/http2"
 )
 
 const (
@@ -67,6 +68,7 @@ type tunnelConfig struct {
 	DoQURL      string   `json:"doq_url"`
 	SystemDNS      []string `json:"system_dns"`
 	PrivateDNS     bool     `json:"private_dns_active"`
+	UseHTTP2       bool     `json:"use_http2"`
 }
 
 func (t *tunnelConfig) sni() string {
@@ -419,12 +421,32 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 	// Certificate cache: generate once, reuse until near expiry.
 	var cachedCert [][]byte
 	var certExpiry time.Time
+	var waitForTraffic bool // after error disconnect, wait for outbound traffic before reconnecting
 
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		default:
+		}
+
+		// Only reconnect when there is actual outbound traffic waiting.
+		// Prevents wasteful reconnects during idle periods.
+		if waitForTraffic {
+			log.Println("Tunnel idle. Waiting for outbound activity before reconnecting...")
+			buf := pool.Get()
+			n, err := device.ReadPacket(buf)
+			pool.Put(buf)
+			if err != nil {
+				if ctx.Err() != nil {
+					return nil
+				}
+				log.Printf("Failed to read from TUN while waiting for activity: %v", err)
+				sleepCtx(ctx, reconnectDelay)
+				continue
+			}
+			log.Printf("Detected outbound activity (%d bytes). Reconnecting...", n)
+			waitForTraffic = false
 		}
 
 		// Reuse cached cert if still valid; regenerate only when near expiry.
@@ -440,7 +462,7 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 			certExpiry = time.Now().Add(24 * time.Hour)
 		}
 
-		tlsCfg, err := api.PrepareTlsConfig(privKey, peerPubKey, cachedCert, cfg.sni())
+		tlsCfg, err := api.PrepareTlsConfig(privKey, peerPubKey, cachedCert, cfg.sni(), false)
 		if err != nil {
 			lastError.Store(err.Error())
 			log.Printf("TLS config: %v", err)
@@ -450,24 +472,45 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 
 		tlsCfg.ClientSessionCache = quicSessionCache // 1-RTT session resumption (not 0-RTT)
 
-		quicCfg := &quic.Config{
-			EnableDatagrams:         true,
-			InitialPacketSize:       1280,
-			KeepAlivePeriod:         30 * time.Second,
-			MaxIdleTimeout:          120 * time.Second,
-			DisablePathMTUDiscovery: true,
+		connectCount.Add(1)
+		var udpConn *net.UDPConn
+		var tr *http3.Transport
+		var ipConn *connectip.Conn
+		var rsp *http.Response
+
+		if cfg.UseHTTP2 {
+			// HTTP/2 (TCP) path
+			var tcpEndpoint *net.TCPAddr
+			if ip := net.ParseIP(cfg.EndpointV4); ip != nil {
+				tcpEndpoint = &net.TCPAddr{IP: ip, Port: connectPort}
+			} else if ip := net.ParseIP(cfg.EndpointV6); ip != nil {
+				tcpEndpoint = &net.TCPAddr{IP: ip, Port: connectPort}
+			}
+			if tcpEndpoint == nil {
+				lastError.Store("no valid endpoints for HTTP/2")
+				log.Println("no valid endpoints for HTTP/2")
+				sleepCtx(ctx, reconnectDelay)
+				continue
+			}
+			log.Printf("Connecting via HTTP/2 to %s", tcpEndpoint)
+			ipConn, rsp, err = connectTunnelProtectedH2(ctx, tlsCfg, tcpEndpoint, cfg.connectUri(), protector)
+		} else {
+			// HTTP/3 (QUIC/UDP) path
+			quicCfg := &quic.Config{
+				EnableDatagrams: true,
+				KeepAlivePeriod: 30 * time.Second,
+				MaxIdleTimeout:  120 * time.Second,
+			}
+			udpConn, tr, ipConn, rsp, err = connectHappyEyeballs(
+				ctx, tlsCfg, quicCfg,
+				cfg.EndpointV4, cfg.EndpointV6,
+				connectPort, cfg.connectUri(), protector,
+			)
 		}
 
-		connectCount.Add(1)
-		udpConn, tr, ipConn, rsp, err := connectHappyEyeballs(
-			ctx, tlsCfg, quicCfg,
-			cfg.EndpointV4, cfg.EndpointV6,
-			connectPort, cfg.connectUri(), protector,
-		)
 		if err != nil {
 			lastError.Store(err.Error())
 			log.Printf("connect: %v", err)
-			// If no network, wait for SetConnectivity(true) instead of hammering
 			if !hasNetwork.Load() {
 				log.Println("no network — waiting for connectivity")
 				waitForNetwork(ctx)
@@ -493,7 +536,7 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 		var wg sync.WaitGroup
 		wg.Add(2)
 		go func() { defer wg.Done(); forwardUp(device, ipConn, pool, errChan, dns, dnsCache) }()
-		go func() { defer wg.Done(); forwardDown(device, ipConn, pool, errChan, dnsCache) }()
+		go func() { defer wg.Done(); forwardDown(device, ipConn, pool, errChan, dnsCache, cfg.UseHTTP2) }()
 
 		select {
 		case err = <-errChan:
@@ -501,10 +544,12 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 			connectedAt.Store(0)
 			lastError.Store(err.Error())
 			log.Printf("tunnel lost: %v", err)
+			waitForTraffic = true // wait for outbound traffic before reconnecting
 		case <-reconnectCh:
 			connected.Store(false)
 			connectedAt.Store(0)
 			log.Println("reconnect requested")
+			waitForTraffic = false // forced reconnect — connect immediately
 		case <-ctx.Done():
 			connected.Store(false)
 			connectedAt.Store(0)
@@ -521,7 +566,9 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 			dns.resetConnections()
 		}
 
-		sleepCtx(ctx, reconnectDelay)
+		if !waitForTraffic {
+			sleepCtx(ctx, reconnectDelay)
+		}
 	}
 }
 
@@ -685,6 +732,67 @@ func connectTunnelProtected(
 	return udpConn, tr, ipConn, rsp, nil
 }
 
+// connectTunnelProtectedH2 establishes a Connect-IP tunnel over HTTP/2 (TCP).
+// Protects the TCP socket from VPN routing before the TLS handshake.
+func connectTunnelProtectedH2(
+	ctx context.Context,
+	tlsConfig *tls.Config,
+	endpoint *net.TCPAddr,
+	connectUri string,
+	protector VpnProtector,
+) (*connectip.Conn, *http.Response, error) {
+	h2TlsConfig := tlsConfig.Clone()
+	h2TlsConfig.NextProtos = []string{"h2"}
+
+	transport := &http2.Transport{
+		DialTLSContext: func(ctx context.Context, network, _ string, _ *tls.Config) (net.Conn, error) {
+			dialer := &net.Dialer{Timeout: 10 * time.Second}
+			conn, err := dialer.DialContext(ctx, network, endpoint.String())
+			if err != nil {
+				return nil, err
+			}
+			// Protect TCP socket from VPN routing
+			if tc, ok := conn.(*net.TCPConn); ok {
+				raw, rawErr := tc.SyscallConn()
+				if rawErr == nil {
+					var protectErr error
+					raw.Control(func(fd uintptr) {
+						if !protector.ProtectFd(int(fd)) {
+							protectErr = errors.New("VPN protect() failed on TCP socket")
+						}
+					})
+					if protectErr != nil {
+						conn.Close()
+						return nil, protectErr
+					}
+				}
+			}
+			tlsConn := tls.Client(conn, h2TlsConfig)
+			if err := tlsConn.HandshakeContext(ctx); err != nil {
+				conn.Close()
+				return nil, err
+			}
+			return tlsConn, nil
+		},
+	}
+
+	h2Client := &http.Client{Transport: transport}
+
+	template := uritemplate.MustNew(connectUri)
+	headers := http.Header{
+		"User-Agent":       {""},
+		"cf-connect-proto": {"cf-connect-ip"},
+		"pq-enabled":       {"false"},
+	}
+
+	ipConn, rsp, err := connectip.DialH2(ctx, h2Client, template, headers)
+	if err != nil {
+		h2Client.CloseIdleConnections()
+		return nil, nil, fmt.Errorf("connect-ip H2: %w", err)
+	}
+	return ipConn, rsp, nil
+}
+
 func forwardUp(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetBuffer, errChan chan<- error, dns *dnsInterceptor, dnsCache *tunnelDnsCache) {
 	for {
 		buf := pool.Get()
@@ -739,12 +847,17 @@ func forwardUp(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetBuf
 	}
 }
 
-func forwardDown(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetBuffer, errChan chan<- error, dnsCache *tunnelDnsCache) {
+func forwardDown(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetBuffer, errChan chan<- error, dnsCache *tunnelDnsCache, useHTTP2 bool) {
 	buf := pool.Get()
 	defer pool.Put(buf)
 	for {
 		n, err := ipConn.ReadPacket(buf, true)
 		if err != nil {
+			// HTTP/2: all read errors are fatal (TCP stream broken = connection gone)
+			if useHTTP2 {
+				errChan <- fmt.Errorf("connection closed while reading from IP connection: %v", err)
+				return
+			}
 			if errors.As(err, new(*connectip.CloseError)) {
 				errChan <- fmt.Errorf("connection closed while reading from IP connection: %v", err)
 				return

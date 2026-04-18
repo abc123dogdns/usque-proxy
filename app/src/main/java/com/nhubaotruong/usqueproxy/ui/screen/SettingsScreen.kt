@@ -264,6 +264,15 @@ fun SettingsScreen(viewModel: VpnViewModel) {
         // Connection section
         item {
             SectionHeader("Connection")
+            SwitchRow("Use HTTP/2 (TCP)", prefs.useHttp2) {
+                viewModel.setUseHttp2(it)
+            }
+            Text(
+                "Connect via HTTP/2 over TCP instead of HTTP/3 over QUIC/UDP",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(start = 4.dp, bottom = 8.dp),
+            )
             var sni by remember(prefs.customSni) { mutableStateOf(prefs.customSni) }
             OutlinedTextField(
                 value = sni,

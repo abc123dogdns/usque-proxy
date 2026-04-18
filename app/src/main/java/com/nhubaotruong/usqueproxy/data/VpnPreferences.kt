@@ -31,6 +31,7 @@ data class VpnPrefs(
     val isZtRegistered: Boolean = false,
     val customSni: String = "",
     val connectUri: String = "",
+    val useHttp2: Boolean = false,
     val autoConnect: Boolean = false,
     val themeMode: ThemeMode = ThemeMode.SYSTEM,
 ) {
@@ -74,6 +75,7 @@ class VpnPreferences(private val context: Context) {
         val IS_ZT_REGISTERED = booleanPreferencesKey("is_zt_registered")
         val CUSTOM_SNI = stringPreferencesKey("custom_sni")
         val CONNECT_URI = stringPreferencesKey("connect_uri")
+        val USE_HTTP2 = booleanPreferencesKey("use_http2")
         val AUTO_CONNECT = booleanPreferencesKey("auto_connect")
         val THEME_MODE = stringPreferencesKey("theme_mode")
     }
@@ -110,6 +112,7 @@ class VpnPreferences(private val context: Context) {
             isWarpRegistered = isWarpReg,
             ztConfigJson = p[Keys.ZT_CONFIG_JSON] ?: "",
             isZtRegistered = p[Keys.IS_ZT_REGISTERED] ?: false,
+            useHttp2 = p[Keys.USE_HTTP2] ?: false,
             autoConnect = p[Keys.AUTO_CONNECT] ?: false,
             customSni = p[Keys.CUSTOM_SNI] ?: "",
             connectUri = p[Keys.CONNECT_URI] ?: "",
@@ -192,6 +195,10 @@ class VpnPreferences(private val context: Context) {
 
     suspend fun setConnectUri(uri: String) {
         context.dataStore.edit { it[Keys.CONNECT_URI] = uri }
+    }
+
+    suspend fun setUseHttp2(enabled: Boolean) {
+        context.dataStore.edit { it[Keys.USE_HTTP2] = enabled }
     }
 
     suspend fun setAutoConnect(enabled: Boolean) {

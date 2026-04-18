@@ -310,6 +310,11 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch { prefs.setConnectUri(uri) }
     }
 
+    fun setUseHttp2(enabled: Boolean) {
+        markRestartNeeded()
+        viewModelScope.launch { prefs.setUseHttp2(enabled) }
+    }
+
     fun setAutoConnect(enabled: Boolean) {
         viewModelScope.launch { prefs.setAutoConnect(enabled) }
     }

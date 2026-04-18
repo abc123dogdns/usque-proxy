@@ -329,6 +329,7 @@ class UsqueVpnService : VpnService() {
             config.put("sni", "zt-masque.cloudflareclient.com")
         }
         if (prefs.connectUri.isNotBlank()) config.put("connect_uri", prefs.connectUri)
+        if (prefs.useHttp2) config.put("use_http2", true)
 
         val builder = Builder()
             .setMtu(1280)
