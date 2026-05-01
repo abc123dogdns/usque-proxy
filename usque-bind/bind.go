@@ -394,10 +394,11 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 
 	pool := api.NewNetBuffer(mtu)
 
-	// Create DNS interceptor (DoH or System DNS) or tunnel DNS cache (fallback).
-	// When Android Private DNS (DoT) is active with system DNS mode, skip our
-	// system DNS interception — Android resolves DNS directly via DoT, so our
-	// interceptor would just add latency for no benefit.
+	// Create DNS interceptor (DoH, DoQ, or System DNS) or tunnel DNS cache (fallback).
+	// In System DNS mode the interceptor forwards port-53 traffic via protected
+	// UDP sockets so DNS packets never enter the QUIC tunnel — even when Android
+	// Private DNS (DoT) is active, since apps may bypass the OS resolver and
+	// emit port-53 directly.
 	var dns *dnsInterceptor
 	var dnsCache *tunnelDnsCache
 	if cfg.DoHURL != "" {
@@ -412,14 +413,16 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 			defer dns.close()
 			log.Println("DNS interception enabled: all port 53 traffic via DoQ")
 		}
-	} else if len(cfg.SystemDNS) > 0 && !cfg.PrivateDNS {
+	} else if len(cfg.SystemDNS) > 0 {
 		dns = newSystemDnsInterceptor(ctx, cfg.SystemDNS, protector)
 		if dns != nil {
 			defer dns.close()
-			log.Printf("System DNS interception enabled: forwarding via protected sockets to %v", cfg.SystemDNS)
+			if cfg.PrivateDNS {
+				log.Printf("System DNS interception enabled (Private DNS active): forwarding port-53 via protected sockets to %v", cfg.SystemDNS)
+			} else {
+				log.Printf("System DNS interception enabled: forwarding via protected sockets to %v", cfg.SystemDNS)
+			}
 		}
-	} else if len(cfg.SystemDNS) > 0 && cfg.PrivateDNS {
-		log.Println("Android Private DNS active — skipping system DNS interception, DNS handled by OS via DoT")
 	} else {
 		dnsCache = newTunnelDnsCache(512)
 		log.Println("DNS tunnel cache enabled")
@@ -771,8 +774,12 @@ func connectTunnelProtected(
 
 	ipConn, rsp, err := connectip.Dial(ctx, hconn, template, "cf-connect-ip", headers, true)
 	if err != nil {
-		tr.Close()
+		_ = tr.Close()
+		_ = conn.CloseWithError(0, "connect-ip dial failed")
 		udpConn.Close()
+		if strings.Contains(err.Error(), "tls: access denied") {
+			return nil, nil, nil, nil, errors.New("login failed: TLS key/cert not enrolled in Cloudflare Access")
+		}
 		return nil, nil, nil, nil, fmt.Errorf("connect-ip: %v", err)
 	}
 	return udpConn, tr, ipConn, rsp, nil
@@ -834,6 +841,9 @@ func connectTunnelProtectedH2(
 	ipConn, rsp, err := connectip.DialH2(ctx, h2Client, template, headers)
 	if err != nil {
 		h2Client.CloseIdleConnections()
+		if strings.Contains(err.Error(), "tls: access denied") {
+			return nil, nil, errors.New("login failed: TLS key/cert not enrolled in Cloudflare Access")
+		}
 		return nil, nil, fmt.Errorf("connect-ip H2: %w", err)
 	}
 	return ipConn, rsp, nil

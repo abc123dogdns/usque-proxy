@@ -4,7 +4,7 @@ go 1.25.5
 
 require (
 	github.com/Diniboy1123/connect-ip-go v0.0.0-20260409225322-8d7bb0a858a2
-	github.com/Diniboy1123/usque v1.5.1-0.20260410184310-24af7b21a56b
+	github.com/Diniboy1123/usque v1.5.1-0.20260421235313-47c1b1bf2c86
 	github.com/quic-go/quic-go v0.59.0
 	github.com/yosida95/uritemplate/v3 v3.0.2
 	golang.org/x/mobile v0.0.0-20260410095206-2cfb76559b7b
@@ -14,8 +14,11 @@ require (
 require (
 	github.com/dunglas/httpsfv v1.1.0 // indirect
 	github.com/google/btree v1.1.3 // indirect
+	github.com/patrickmn/go-cache v2.1.0+incompatible // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
 	github.com/songgao/water v0.0.0-20200317203138-2b4b6d7c09d8 // indirect
+	github.com/txthinking/runnergroup v0.0.0-20210608031112-152c7c4432bf // indirect
+	github.com/txthinking/socks5 v0.0.0-20251011041537-5c31f201a10e // indirect
 	golang.org/x/crypto v0.50.0 // indirect
 	golang.org/x/exp v0.0.0-20260410095643-746e56fc9e2f // indirect
 	golang.org/x/mod v0.35.0 // indirect
