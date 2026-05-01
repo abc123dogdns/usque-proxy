@@ -59,9 +59,7 @@ jobs:
             "keyPassword=${{ secrets.KEY_PASSWORD }}" \
             > keystore.properties
 
-      - name: Setup tmate session
-        uses: mxschmitt/action-tmate@v3
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.debug_enabled }}
+
 
       - name: Build release APK
         run: ./gradlew assembleRelease
